@@ -66,6 +66,10 @@ message Body {
   string relayServerAddress = 8;
 
   optional bytes sessionId = 10;
+
+  // linkId identifies which transport link this ICE negotiation is for.
+  // Empty string means legacy single-link mode.
+  string linkId = 11;
 }
 
 // Mode indicates a connection mode

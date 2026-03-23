@@ -116,6 +116,16 @@ func (s *BaseServer) Start(ctx context.Context) error {
 	s.cancel = cancel
 	s.errCh = make(chan error, 4)
 
+	// Initialize encryption cipher if configured.
+	if ct := s.Config.CipherType; ct != "" {
+		cipher, err := encryption.NewCipher(encryption.CipherType(ct))
+		if err != nil {
+			return fmt.Errorf("initialize cipher %q: %w", ct, err)
+		}
+		encryption.SetActiveCipher(cipher)
+		log.Infof("using %s cipher for message encryption", ct)
+	}
+
 	if s.autoResolveDomains {
 		s.resolveDomains(srvCtx)
 	}

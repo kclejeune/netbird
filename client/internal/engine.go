@@ -66,6 +66,8 @@ import (
 	signal "github.com/netbirdio/netbird/shared/signal/client"
 	sProto "github.com/netbirdio/netbird/shared/signal/proto"
 	"github.com/netbirdio/netbird/util"
+
+	"github.com/netbirdio/netbird/client/internal/link"
 )
 
 // PeerConnectionTimeoutMax is a timeout of an initial connection attempt to a remote peer.
@@ -135,6 +137,10 @@ type EngineConfig struct {
 
 	MTU uint16
 
+	// CipherType selects the encryption algorithm for management/signal communication.
+	// Valid values: "nacl" (default, backward compatible) or "aesgcm" (FIPS-compliant).
+	CipherType string
+
 	// for debug bundle generation
 	ProfileConfig *profilemanager.Config
 
@@ -187,6 +193,10 @@ type Engine struct {
 	cancel context.CancelFunc
 
 	wgInterface WGIface
+
+	// linkManager manages multiple transport links for multi-link mesh.
+	// In single-link mode, it wraps the primary wgInterface.
+	linkManager *link.Manager
 
 	udpMux *udpmux.UniversalUDPMuxDefault
 
@@ -437,6 +447,7 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 		return fmt.Errorf("new wg interface: %w", err)
 	}
 	e.wgInterface = wgIface
+	e.linkManager = link.NewManager(wgIface)
 	e.statusRecorder.SetWgIface(wgIface)
 
 	// start flow manager right after interface creation
@@ -1252,6 +1263,9 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
 		log.Errorf("failed to update forward rules, err: %v", err)
 	}
 
+	// Update link configurations from remote peers if any have multi-link configs.
+	e.updateLinkConfigs(networkMap.GetRemotePeers())
+
 	log.Debugf("got peers update from Management Service, total peers to connect to = %d", len(networkMap.GetRemotePeers()))
 
 	e.updateOfflinePeers(networkMap.GetOfflinePeers())
@@ -1667,6 +1681,13 @@ func (e *Engine) parseNATExternalIPMappings() []string {
 
 func (e *Engine) close() {
 	log.Debugf("removing Netbird interface %s", e.config.WgIfaceName)
+
+	if e.linkManager != nil {
+		if err := e.linkManager.Close(); err != nil {
+			log.Errorf("failed closing link manager: %v", err)
+		}
+		e.linkManager = nil
+	}
 
 	if e.wgInterface != nil {
 		if err := e.wgInterface.Close(); err != nil {
@@ -2354,4 +2375,32 @@ func convertToOfferAnswer(msg *sProto.Message) (*peer.OfferAnswer, error) {
 		SessionID:       sessionID,
 	}
 	return &offerAnswer, nil
+}
+
+// LinkManager returns the engine's link manager for multi-link transport coordination.
+func (e *Engine) LinkManager() *link.Manager {
+	return e.linkManager
+}
+
+// updateLinkConfigs collects link configurations from all remote peers and
+// updates the LinkManager. This allows the engine to be aware of available
+// transport links for each peer.
+func (e *Engine) updateLinkConfigs(remotePeers []*mgmProto.RemotePeerConfig) {
+	if e.linkManager == nil {
+		return
+	}
+
+	var allLinks []*mgmProto.LinkConfig
+	for _, p := range remotePeers {
+		links := p.GetLinks()
+		if len(links) > 0 {
+			allLinks = append(allLinks, links...)
+			log.Debugf("peer %s has %d link configs", p.GetWgPubKey(), len(links))
+		}
+	}
+
+	if len(allLinks) > 0 {
+		e.linkManager.UpdateFromConfig(allLinks)
+		log.Infof("updated link manager with %d link configs from %d peers", len(allLinks), len(remotePeers))
+	}
 }

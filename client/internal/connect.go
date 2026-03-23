@@ -33,6 +33,7 @@ import (
 	nbnet "github.com/netbirdio/netbird/client/net"
 	cProto "github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/client/ssh"
+	nbEncryption "github.com/netbirdio/netbird/encryption"
 	sshconfig "github.com/netbirdio/netbird/client/ssh/config"
 	"github.com/netbirdio/netbird/client/system"
 	mgm "github.com/netbirdio/netbird/shared/management/client"
@@ -186,6 +187,16 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 	if err != nil {
 		log.Errorf("failed parsing Wireguard key %s: [%s]", c.config.PrivateKey, err.Error())
 		return wrapErr(err)
+	}
+
+	// Initialize the encryption cipher based on configuration.
+	if ct := c.config.CipherType; ct != "" {
+		cipher, err := nbEncryption.NewCipher(nbEncryption.CipherType(ct))
+		if err != nil {
+			return wrapErr(fmt.Errorf("initialize cipher %q: %w", ct, err))
+		}
+		nbEncryption.SetActiveCipher(cipher)
+		log.Infof("using %s cipher for message encryption", ct)
 	}
 
 	var mgmTlsEnabled bool
@@ -550,8 +561,9 @@ func createEngineConfig(key wgtypes.Key, config *profilemanager.Config, peerConf
 
 		LazyConnectionEnabled: config.LazyConnectionEnabled,
 
-		MTU:     selectMTU(config.MTU, peerConfig.Mtu),
-		LogPath: logPath,
+		MTU:        selectMTU(config.MTU, peerConfig.Mtu),
+		CipherType: config.CipherType,
+		LogPath:    logPath,
 
 		ProfileConfig: config,
 	}

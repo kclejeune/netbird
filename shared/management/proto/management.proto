@@ -421,6 +421,10 @@ message RemotePeerConfig {
   string fqdn = 4;
 
   string agentVersion = 5;
+
+  // links contains per-link transport configurations for multi-link mesh.
+  // Empty for single-link (legacy) mode.
+  repeated LinkConfig links = 6;
 }
 
 // SSHConfig represents SSH configurations of a peer.
@@ -684,3 +688,48 @@ message StopExposeRequest {
 }
 
 message StopExposeResponse {}
+
+// LinkConfig describes a single transport link to a remote peer.
+// Each peer may be reachable over multiple links (e.g., WAN, Silvus MANET).
+message LinkConfig {
+  // Unique identifier for this link (e.g., "wan0", "silvus0").
+  string linkId = 1;
+
+  // Transport type: "wireguard", "relay", or a custom transport plugin name.
+  string transportType = 2;
+
+  // Endpoint address for this link (host:port or multicast group).
+  string endpoint = 3;
+
+  // Link-specific MTU. 0 means use default.
+  uint32 mtu = 4;
+
+  // Priority for path selection (lower = preferred). 0 is highest priority.
+  uint32 priority = 5;
+
+  // Cost metric for routing protocol integration (e.g., Babel).
+  uint32 cost = 6;
+
+  // WireGuard interface name to use for this link (if transport is wireguard).
+  string wgIfaceName = 7;
+
+  // Whether this link supports multicast discovery.
+  bool multicastEnabled = 8;
+}
+
+// LinkStatusUpdate reports the health of a specific link from a peer.
+message LinkStatusUpdate {
+  string linkId = 1;
+
+  // Whether the link is currently up.
+  bool up = 2;
+
+  // Round-trip latency in milliseconds.
+  uint32 latencyMs = 3;
+
+  // Packet loss percentage (0-100).
+  uint32 lossPercent = 4;
+
+  // Available bandwidth in kbps (0 = unknown).
+  uint64 bandwidthKbps = 5;
+}

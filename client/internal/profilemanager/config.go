@@ -159,6 +159,10 @@ type Config struct {
 	LazyConnectionEnabled bool
 
 	MTU uint16
+
+	// CipherType selects the encryption algorithm for management/signal communication.
+	// Valid values: "nacl" (default, backward compatible) or "aesgcm" (FIPS-compliant).
+	CipherType string
 }
 
 var ConfigDirOverride string
