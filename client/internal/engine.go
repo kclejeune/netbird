@@ -2390,12 +2390,22 @@ func (e *Engine) updateLinkConfigs(remotePeers []*mgmProto.RemotePeerConfig) {
 		return
 	}
 
-	var allLinks []*mgmProto.LinkConfig
+	var allLinks []link.LinkConfigMsg
 	for _, p := range remotePeers {
-		links := p.GetLinks()
-		if len(links) > 0 {
-			allLinks = append(allLinks, links...)
-			log.Debugf("peer %s has %d link configs", p.GetWgPubKey(), len(links))
+		for _, lc := range p.GetLinks() {
+			allLinks = append(allLinks, link.LinkConfigMsg{
+				LinkID:           lc.GetLinkId(),
+				TransportType:    lc.GetTransportType(),
+				Endpoint:         lc.GetEndpoint(),
+				MTU:              lc.GetMtu(),
+				Priority:         lc.GetPriority(),
+				Cost:             lc.GetCost(),
+				WgIfaceName:      lc.GetWgIfaceName(),
+				MulticastEnabled: lc.GetMulticastEnabled(),
+			})
+		}
+		if len(p.GetLinks()) > 0 {
+			log.Debugf("peer %s has %d link configs", p.GetWgPubKey(), len(p.GetLinks()))
 		}
 	}
 

@@ -11,47 +11,32 @@ package link
 
 import (
 	"fmt"
-	"net"
-	"net/netip"
 	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-
-	"github.com/netbirdio/netbird/client/iface/configurer"
-	"github.com/netbirdio/netbird/client/iface/device"
-	"github.com/netbirdio/netbird/client/iface/netstack"
-	"github.com/netbirdio/netbird/client/iface/wgaddr"
-	"github.com/netbirdio/netbird/client/iface/wgproxy"
-
-	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 )
 
-// WGIface is the WireGuard interface contract used by the Engine.
-// This mirrors the internal WGIface interface.
-type WGIface interface {
-	Create() error
-	IsUserspaceBind() bool
+// Iface is the minimal interface required by the link Manager for lifecycle
+// management. The full WireGuard interface (WGIface) satisfies this interface.
+// Consumers that need the full WGIface should type-assert the Link.Iface value.
+type Iface interface {
 	Name() string
-	Address() wgaddr.Address
-	ToInterface() *net.Interface
-	UpdateAddr(newAddr string) error
-	GetProxy() wgproxy.Proxy
-	GetProxyPort() uint16
-	UpdatePeer(peerKey string, allowedIps []netip.Prefix, keepAlive time.Duration, endpoint *net.UDPAddr, preSharedKey *wgtypes.Key) error
-	RemoveEndpointAddress(key string) error
-	RemovePeer(peerKey string) error
-	AddAllowedIP(peerKey string, allowedIP netip.Prefix) error
-	RemoveAllowedIP(peerKey string, allowedIP netip.Prefix) error
 	Close() error
-	SetFilter(filter device.PacketFilter) error
-	GetFilter() device.PacketFilter
-	GetDevice() *device.FilteredDevice
-	GetWGDevice() *wgtypes.Device
-	GetStats() (map[string]configurer.WGStats, error)
-	GetNet() *netstack.Net
-	FullStats() (*configurer.Stats, error)
+}
+
+// LinkConfigMsg is a proto-independent representation of a link configuration
+// received from the management server. The engine layer converts from the
+// protobuf type to this struct.
+type LinkConfigMsg struct {
+	LinkID           string
+	TransportType    string
+	Endpoint         string
+	MTU              uint32
+	Priority         uint32
+	Cost             uint32
+	WgIfaceName      string
+	MulticastEnabled bool
 }
 
 // LinkState represents the health of a single link.
@@ -77,11 +62,13 @@ type Link struct {
 	// Cost metric for routing protocol integration.
 	Cost uint32
 
-	// Iface is the WireGuard interface for this link.
-	Iface WGIface
+	// Iface is the interface for this link. For WireGuard links this will be
+	// the full WGIface; consumers should type-assert to the full interface
+	// when they need WG-specific operations.
+	Iface Iface
 
 	// Config from management server.
-	Config *mgmProto.LinkConfig
+	Config *LinkConfigMsg
 
 	mu    sync.RWMutex
 	state LinkState
@@ -105,17 +92,17 @@ func (l *Link) UpdateState(s LinkState) {
 //
 // In single-link mode (the default), it wraps the primary WireGuard interface
 // and all operations pass through to it transparently. In multi-link mode,
-// it manages multiple WGIface instances and provides path selection.
+// it manages multiple Iface instances and provides path selection.
 type Manager struct {
 	mu      sync.RWMutex
-	links   map[string]*Link   // linkID -> Link
-	primary string             // ID of the primary (default) link
-	byPeer  map[string]*Link   // peerPubKey -> preferred link (cache)
+	links   map[string]*Link // linkID -> Link
+	primary string           // ID of the primary (default) link
+	byPeer  map[string]*Link // peerPubKey -> preferred link (cache)
 }
 
 // NewManager creates a new link Manager.
-// The primary WGIface is registered as the "default" link for backward compatibility.
-func NewManager(primaryIface WGIface) *Manager {
+// The primary Iface is registered as the "default" link for backward compatibility.
+func NewManager(primaryIface Iface) *Manager {
 	m := &Manager{
 		links:  make(map[string]*Link),
 		byPeer: make(map[string]*Link),
@@ -136,9 +123,9 @@ func NewManager(primaryIface WGIface) *Manager {
 	return m
 }
 
-// Primary returns the primary (default) WireGuard interface.
+// Primary returns the primary (default) interface.
 // This provides backward compatibility with code that expects a single interface.
-func (m *Manager) Primary() WGIface {
+func (m *Manager) Primary() Iface {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if l, ok := m.links[m.primary]; ok {
@@ -221,8 +208,8 @@ func (m *Manager) IsMultiLink() bool {
 // The current implementation uses a simple priority-based selection.
 // A more sophisticated implementation would consider link health metrics.
 func (m *Manager) SelectLink(peerPubKey string) *Link {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	// Check cache first.
 	if cached, ok := m.byPeer[peerPubKey]; ok {
@@ -260,34 +247,35 @@ func (m *Manager) InvalidatePeerCache(peerPubKey string) {
 // UpdateFromConfig applies link configuration from the management server.
 // New links are added, existing links are updated, and links not in the
 // config are marked for removal (but not removed, to allow graceful teardown).
-func (m *Manager) UpdateFromConfig(linkConfigs []*mgmProto.LinkConfig) {
+func (m *Manager) UpdateFromConfig(linkConfigs []LinkConfigMsg) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	seen := make(map[string]bool)
-	for _, lc := range linkConfigs {
-		seen[lc.LinkId] = true
+	for i := range linkConfigs {
+		lc := &linkConfigs[i]
+		seen[lc.LinkID] = true
 
-		existing, ok := m.links[lc.LinkId]
+		existing, ok := m.links[lc.LinkID]
 		if ok {
 			// Update metadata.
 			existing.Priority = lc.Priority
 			existing.Cost = lc.Cost
 			existing.TransportType = lc.TransportType
 			existing.Config = lc
-			log.Debugf("updated link config for %s", lc.LinkId)
+			log.Debugf("updated link config for %s", lc.LinkID)
 		} else {
 			// New link — the interface will be created by the engine when it processes
 			// the link config. For now, register a placeholder.
-			m.links[lc.LinkId] = &Link{
-				ID:            lc.LinkId,
+			m.links[lc.LinkID] = &Link{
+				ID:            lc.LinkID,
 				TransportType: lc.TransportType,
 				Priority:      lc.Priority,
 				Cost:          lc.Cost,
 				Config:        lc,
 				state:         LinkState{Up: false},
 			}
-			log.Infof("registered new link %s from config (transport=%s, pending interface creation)", lc.LinkId, lc.TransportType)
+			log.Infof("registered new link %s from config (transport=%s, pending interface creation)", lc.LinkID, lc.TransportType)
 		}
 	}
 
