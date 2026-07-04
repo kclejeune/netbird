@@ -92,6 +92,11 @@ type Config struct {
 	// MeshPrefix is the prefix whose routes are redistributed (allow); all others
 	// are denied.
 	MeshPrefix string
+
+	// DisableKernelRules, when true, skips installing the policy-routing rule that
+	// steers the mesh prefix to babeld's export table. babeld still runs and
+	// populates its table, but the kernel won't consult it. Default false.
+	DisableKernelRules bool
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -153,6 +158,11 @@ type Manager struct {
 
 	// onRouteUpdate is called when routes change (optional callback).
 	onRouteUpdate func([]RouteEntry)
+
+	// ruleInstaller applies the policy-routing rule that makes babeld's exported
+	// routes take effect; installedRules tracks what to remove on stop.
+	ruleInstaller  RuleInstaller
+	installedRules []RuleSpec
 }
 
 // NewManager creates a new Babel manager with the given configuration.
@@ -180,8 +190,9 @@ func NewManager(cfg Config) *Manager {
 	}
 
 	return &Manager{
-		config:     cfg,
-		socketPath: cfg.SocketPath,
+		config:        cfg,
+		socketPath:    cfg.SocketPath,
+		ruleInstaller: defaultRuleInstaller(),
 	}
 }
 
@@ -240,6 +251,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.cmd = cmd
 	m.running = true
 
+	// Install the policy-routing rule so the kernel actually consults babeld's
+	// export table for mesh traffic. Best-effort; babeld still runs without it.
+	m.installRouteRulesLocked()
+
 	// Monitor babeld process in background.
 	go m.waitForExit(childCtx)
 
@@ -254,6 +269,10 @@ func (m *Manager) Stop() error {
 	if !m.running {
 		return nil
 	}
+
+	// Remove our steering rule before the process goes away so the kernel stops
+	// consulting a table that is about to be emptied.
+	m.removeRouteRulesLocked()
 
 	if m.cancel != nil {
 		m.cancel()
