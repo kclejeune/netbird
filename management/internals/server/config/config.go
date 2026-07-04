@@ -65,6 +65,34 @@ type Config struct {
 	// CipherType selects the encryption algorithm for management-to-client communication.
 	// Valid values: "nacl" (default, backward compatible) or "aesgcm" (FIPS-compliant).
 	CipherType string
+
+	// MeshLinks statically assigns transport links to peers, distributed to other
+	// peers via RemotePeerConfig.Links. This is the config-file-driven source for
+	// multi-link topology, symmetric with the client's local mesh config; a
+	// dynamic admin API is future work. Empty means no server-assigned links.
+	MeshLinks []MeshLinkAssignment
+}
+
+// MeshLinkAssignment assigns a set of transport links to a peer (by WireGuard
+// public key) for distribution in the network map.
+type MeshLinkAssignment struct {
+	// PeerKey is the WireGuard public key of the peer these links describe.
+	PeerKey string
+	// Links are the transport links the peer is reachable over.
+	Links []MeshLink
+}
+
+// MeshLink is the config-file representation of a transport link. It mirrors the
+// proto LinkConfig and the client/server mesh link types.
+type MeshLink struct {
+	LinkID           string
+	TransportType    string
+	Endpoint         string
+	MTU              uint32
+	Priority         uint32
+	Cost             uint32
+	WgIfaceName      string
+	MulticastEnabled bool
 }
 
 // GetAuthAudiences returns the audience from the http config and device authorization flow config

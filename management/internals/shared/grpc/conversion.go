@@ -131,14 +131,16 @@ func ToSyncResponse(ctx context.Context, config *nbconfig.Config, httpConfig *nb
 
 	response.NetworkMap.PeerConfig = response.PeerConfig
 
+	configLinks := meshLinksByPeer(config.MeshLinks)
+
 	remotePeers := make([]*proto.RemotePeerConfig, 0, len(networkMap.Peers)+len(networkMap.OfflinePeers))
-	remotePeers = appendRemotePeerConfig(remotePeers, networkMap.Peers, dnsName)
+	remotePeers = appendRemotePeerConfig(remotePeers, networkMap.Peers, dnsName, configLinks)
 	response.RemotePeers = remotePeers
 	response.NetworkMap.RemotePeers = remotePeers
 	response.RemotePeersIsEmpty = len(remotePeers) == 0
 	response.NetworkMap.RemotePeersIsEmpty = response.RemotePeersIsEmpty
 
-	response.NetworkMap.OfflinePeers = appendRemotePeerConfig(nil, networkMap.OfflinePeers, dnsName)
+	response.NetworkMap.OfflinePeers = appendRemotePeerConfig(nil, networkMap.OfflinePeers, dnsName, configLinks)
 
 	firewallRules := toProtocolFirewallRules(networkMap.FirewallRules)
 	response.NetworkMap.FirewallRules = firewallRules
@@ -195,7 +197,7 @@ func buildAuthorizedUsersProto(ctx context.Context, authorizedUsers map[string]m
 	return hashedUsers, machineUsers
 }
 
-func appendRemotePeerConfig(dst []*proto.RemotePeerConfig, peers []*nbpeer.Peer, dnsName string) []*proto.RemotePeerConfig {
+func appendRemotePeerConfig(dst []*proto.RemotePeerConfig, peers []*nbpeer.Peer, dnsName string, configLinks map[string][]*proto.LinkConfig) []*proto.RemotePeerConfig {
 	for _, rPeer := range peers {
 		dst = append(dst, &proto.RemotePeerConfig{
 			WgPubKey:     rPeer.Key,
@@ -203,15 +205,27 @@ func appendRemotePeerConfig(dst []*proto.RemotePeerConfig, peers []*nbpeer.Peer,
 			SshConfig:    &proto.SSHConfig{SshPubKey: []byte(rPeer.SSHKey)},
 			Fqdn:         rPeer.FQDN(dnsName),
 			AgentVersion: rPeer.Meta.WtVersion,
-			Links:        toProtoLinks(rPeer.MeshLinks),
+			Links:        resolvePeerLinks(rPeer, configLinks),
 		})
 	}
 	return dst
 }
 
-// toProtoLinks converts a peer's server-side mesh links into proto LinkConfigs
-// for distribution in the network map. Returns nil when the peer has no links,
-// keeping RemotePeerConfig wire-identical to the pre-multi-link format.
+// resolvePeerLinks picks a peer's link set: an explicit in-memory Peer.MeshLinks
+// wins (e.g. programmatic/admin assignment), otherwise the config-file source
+// keyed by WireGuard public key. Returns nil when neither is set, keeping
+// RemotePeerConfig wire-identical to the pre-multi-link format.
+func resolvePeerLinks(rPeer *nbpeer.Peer, configLinks map[string][]*proto.LinkConfig) []*proto.LinkConfig {
+	if len(rPeer.MeshLinks) > 0 {
+		return toProtoLinks(rPeer.MeshLinks)
+	}
+	if configLinks != nil {
+		return configLinks[rPeer.Key]
+	}
+	return nil
+}
+
+// toProtoLinks converts a peer's server-side mesh links into proto LinkConfigs.
 func toProtoLinks(links []nbpeer.MeshLink) []*proto.LinkConfig {
 	if len(links) == 0 {
 		return nil
@@ -228,6 +242,35 @@ func toProtoLinks(links []nbpeer.MeshLink) []*proto.LinkConfig {
 			WgIfaceName:      l.WgIfaceName,
 			MulticastEnabled: l.MulticastEnabled,
 		})
+	}
+	return out
+}
+
+// meshLinksByPeer indexes the server config's static link assignments by peer
+// WireGuard public key, converting them to proto LinkConfigs once per sync.
+func meshLinksByPeer(assignments []nbconfig.MeshLinkAssignment) map[string][]*proto.LinkConfig {
+	if len(assignments) == 0 {
+		return nil
+	}
+	out := make(map[string][]*proto.LinkConfig, len(assignments))
+	for _, a := range assignments {
+		if len(a.Links) == 0 {
+			continue
+		}
+		links := make([]*proto.LinkConfig, 0, len(a.Links))
+		for _, l := range a.Links {
+			links = append(links, &proto.LinkConfig{
+				LinkId:           l.LinkID,
+				TransportType:    l.TransportType,
+				Endpoint:         l.Endpoint,
+				Mtu:              l.MTU,
+				Priority:         l.Priority,
+				Cost:             l.Cost,
+				WgIfaceName:      l.WgIfaceName,
+				MulticastEnabled: l.MulticastEnabled,
+			})
+		}
+		out[a.PeerKey] = links
 	}
 	return out
 }

@@ -35,7 +35,7 @@ func TestAppendRemotePeerConfig_Links(t *testing.T) {
 		{Key: "pubB", IP: net.ParseIP("100.64.0.3")}, // no links
 	}
 
-	out := appendRemotePeerConfig(nil, peers, "example.com")
+	out := appendRemotePeerConfig(nil, peers, "example.com", nil)
 	if len(out) != 2 {
 		t.Fatalf("expected 2 remote peer configs, got %d", len(out))
 	}
@@ -61,6 +61,57 @@ func TestAppendRemotePeerConfig_Links(t *testing.T) {
 	// Peer B has no links -> nil, preserving pre-multi-link wire format.
 	if len(out[1].GetLinks()) != 0 {
 		t.Fatalf("peerB should have no links, got %d", len(out[1].GetLinks()))
+	}
+}
+
+func TestAppendRemotePeerConfig_ConfigLinks(t *testing.T) {
+	// Config assigns links to pubB; pubA has an in-memory override; pubC neither.
+	configLinks := meshLinksByPeer([]nbconfig.MeshLinkAssignment{
+		{
+			PeerKey: "pubB",
+			Links: []nbconfig.MeshLink{{
+				LinkID:        "silvus0",
+				TransportType: "wireguard",
+				Endpoint:      "10.9.9.9:51820",
+				Priority:      20,
+				Cost:          70,
+			}},
+		},
+	})
+
+	peers := []*nbpeer.Peer{
+		{
+			Key: "pubA", IP: net.ParseIP("100.64.0.2"),
+			MeshLinks: []nbpeer.MeshLink{{LinkID: "mesh0", TransportType: "wireguard", Endpoint: "10.0.0.2:51820"}},
+		},
+		{Key: "pubB", IP: net.ParseIP("100.64.0.3")},
+		{Key: "pubC", IP: net.ParseIP("100.64.0.4")},
+	}
+
+	out := appendRemotePeerConfig(nil, peers, "example.com", configLinks)
+	if len(out) != 3 {
+		t.Fatalf("expected 3, got %d", len(out))
+	}
+
+	// pubA: in-memory override wins over config (config has none for it anyway).
+	if la := out[0].GetLinks(); len(la) != 1 || la[0].GetLinkId() != "mesh0" {
+		t.Fatalf("pubA should use in-memory link mesh0, got %+v", la)
+	}
+	// pubB: sourced from config.
+	lb := out[1].GetLinks()
+	if len(lb) != 1 || lb[0].GetLinkId() != "silvus0" || lb[0].GetEndpoint() != "10.9.9.9:51820" ||
+		lb[0].GetPriority() != 20 || lb[0].GetCost() != 70 {
+		t.Fatalf("pubB should use config link silvus0, got %+v", lb)
+	}
+	// pubC: no links from either source.
+	if len(out[2].GetLinks()) != 0 {
+		t.Fatalf("pubC should have no links, got %d", len(out[2].GetLinks()))
+	}
+}
+
+func TestMeshLinksByPeer_Empty(t *testing.T) {
+	if m := meshLinksByPeer(nil); m != nil {
+		t.Fatalf("expected nil map for no assignments, got %v", m)
 	}
 }
 
