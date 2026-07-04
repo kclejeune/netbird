@@ -203,9 +203,33 @@ func appendRemotePeerConfig(dst []*proto.RemotePeerConfig, peers []*nbpeer.Peer,
 			SshConfig:    &proto.SSHConfig{SshPubKey: []byte(rPeer.SSHKey)},
 			Fqdn:         rPeer.FQDN(dnsName),
 			AgentVersion: rPeer.Meta.WtVersion,
+			Links:        toProtoLinks(rPeer.MeshLinks),
 		})
 	}
 	return dst
+}
+
+// toProtoLinks converts a peer's server-side mesh links into proto LinkConfigs
+// for distribution in the network map. Returns nil when the peer has no links,
+// keeping RemotePeerConfig wire-identical to the pre-multi-link format.
+func toProtoLinks(links []nbpeer.MeshLink) []*proto.LinkConfig {
+	if len(links) == 0 {
+		return nil
+	}
+	out := make([]*proto.LinkConfig, 0, len(links))
+	for _, l := range links {
+		out = append(out, &proto.LinkConfig{
+			LinkId:           l.LinkID,
+			TransportType:    l.TransportType,
+			Endpoint:         l.Endpoint,
+			Mtu:              l.MTU,
+			Priority:         l.Priority,
+			Cost:             l.Cost,
+			WgIfaceName:      l.WgIfaceName,
+			MulticastEnabled: l.MulticastEnabled,
+		})
+	}
+	return out
 }
 
 // toProtocolDNSConfig converts nbdns.Config to proto.DNSConfig using the cache

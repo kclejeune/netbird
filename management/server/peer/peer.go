@@ -58,6 +58,27 @@ type Peer struct {
 	ExtraDNSLabels []string `gorm:"serializer:json"`
 	// AllowExtraDNSLabels indicates whether the peer allows extra DNS labels to be used for resolving the peer
 	AllowExtraDNSLabels bool
+
+	// MeshLinks are the transport links this peer is reachable over, distributed
+	// to other peers in the network map as RemotePeerConfig.Links. It is
+	// intentionally not persisted (gorm:"-"): populating it from an admin
+	// API / account topology is future work; for now it is an in-memory source
+	// that the network-map builder emits when present.
+	MeshLinks []MeshLink `gorm:"-" json:"-"`
+}
+
+// MeshLink is a server-side description of one transport link a peer is
+// reachable over. It mirrors proto.LinkConfig and is emitted into the network
+// map so clients can populate their LinkManager.
+type MeshLink struct {
+	LinkID           string
+	TransportType    string
+	Endpoint         string
+	MTU              uint32
+	Priority         uint32
+	Cost             uint32
+	WgIfaceName      string
+	MulticastEnabled bool
 }
 
 type ProxyMeta struct {
@@ -237,6 +258,7 @@ func (p *Peer) Copy() *Peer {
 		InactivityExpirationEnabled: p.InactivityExpirationEnabled,
 		ExtraDNSLabels:              slices.Clone(p.ExtraDNSLabels),
 		AllowExtraDNSLabels:         p.AllowExtraDNSLabels,
+		MeshLinks:                   slices.Clone(p.MeshLinks),
 	}
 }
 

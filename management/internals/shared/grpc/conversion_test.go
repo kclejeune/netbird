@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
 	"reflect"
 	"testing"
@@ -12,7 +13,56 @@ import (
 	"github.com/netbirdio/netbird/management/internals/controllers/network_map"
 	"github.com/netbirdio/netbird/management/internals/controllers/network_map/controller/cache"
 	nbconfig "github.com/netbirdio/netbird/management/internals/server/config"
+	nbpeer "github.com/netbirdio/netbird/management/server/peer"
 )
+
+func TestAppendRemotePeerConfig_Links(t *testing.T) {
+	peers := []*nbpeer.Peer{
+		{
+			Key: "pubA",
+			IP:  net.ParseIP("100.64.0.2"),
+			MeshLinks: []nbpeer.MeshLink{{
+				LinkID:           "mesh0",
+				TransportType:    "wireguard",
+				Endpoint:         "10.0.0.2:51820",
+				MTU:              1280,
+				Priority:         10,
+				Cost:             50,
+				WgIfaceName:      "wt-mesh0",
+				MulticastEnabled: true,
+			}},
+		},
+		{Key: "pubB", IP: net.ParseIP("100.64.0.3")}, // no links
+	}
+
+	out := appendRemotePeerConfig(nil, peers, "example.com")
+	if len(out) != 2 {
+		t.Fatalf("expected 2 remote peer configs, got %d", len(out))
+	}
+
+	// Base fields still set as before.
+	if out[0].GetWgPubKey() != "pubA" || out[0].GetAllowedIps()[0] != "100.64.0.2/32" {
+		t.Fatalf("base fields wrong: %+v", out[0])
+	}
+
+	// Peer A links populated and mapped field-for-field.
+	la := out[0].GetLinks()
+	if len(la) != 1 {
+		t.Fatalf("peerA expected 1 link, got %d", len(la))
+	}
+	l := la[0]
+	if l.GetLinkId() != "mesh0" || l.GetTransportType() != "wireguard" ||
+		l.GetEndpoint() != "10.0.0.2:51820" || l.GetMtu() != 1280 ||
+		l.GetPriority() != 10 || l.GetCost() != 50 ||
+		l.GetWgIfaceName() != "wt-mesh0" || !l.GetMulticastEnabled() {
+		t.Fatalf("peerA link fields wrong: %+v", l)
+	}
+
+	// Peer B has no links -> nil, preserving pre-multi-link wire format.
+	if len(out[1].GetLinks()) != 0 {
+		t.Fatalf("peerB should have no links, got %d", len(out[1].GetLinks()))
+	}
+}
 
 func TestToProtocolDNSConfigWithCache(t *testing.T) {
 	var cache cache.DNSConfigCache
