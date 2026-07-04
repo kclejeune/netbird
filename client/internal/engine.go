@@ -2,6 +2,8 @@ package internal
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -51,6 +53,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
 	"github.com/netbirdio/netbird/client/internal/relay"
 	"github.com/netbirdio/netbird/client/internal/rosenpass"
+	"github.com/netbirdio/netbird/client/internal/roster"
 	"github.com/netbirdio/netbird/client/internal/routemanager"
 	"github.com/netbirdio/netbird/client/internal/routemanager/systemops"
 	"github.com/netbirdio/netbird/client/internal/statemanager"
@@ -143,6 +146,11 @@ type EngineConfig struct {
 	// MeshLinks are locally-configured secondary transport links (interface +
 	// static peers). Empty means single-link behavior.
 	MeshLinks []profilemanager.MeshLinkConfig
+
+	// Roster settings for disconnected ("offline island") operation.
+	RosterPath         string
+	RosterTrustAnchor  string
+	RosterGraceSeconds int
 
 	// for debug bundle generation
 	ProfileConfig *profilemanager.Config
@@ -573,6 +581,7 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	e.startMeshLinks()
 	e.startBabel()
 	e.startLinkMonitor()
+	e.startRoster()
 
 	// if inbound conns are blocked there is no need to create the ACL manager
 	if e.firewall != nil && !e.config.BlockInbound {
@@ -2586,6 +2595,96 @@ func parsePrefixes(cidrs []string) ([]netip.Prefix, error) {
 		out = append(out, pfx)
 	}
 	return out, nil
+}
+
+// defaultRosterGrace is the fallback grace period past a roster's expiry when
+// none is configured — generous, because a disconnected mission may run long
+// past the authority's last contact.
+const defaultRosterGrace = 24 * time.Hour
+
+// startRoster bootstraps disconnected ("offline island") operation from a signed
+// roster when one is configured. It accepts a fresh roster (persisting it as
+// last-known-good), or falls back to the last-known-good roster in degraded mode
+// if the fresh one is missing/expired, then programs any static-endpoint peers.
+// Peers without a static endpoint await multicast beacon discovery (not yet
+// wired) and are counted but not programmed.
+func (e *Engine) startRoster() {
+	if e.config.RosterPath == "" {
+		return
+	}
+	anchor, err := base64.StdEncoding.DecodeString(e.config.RosterTrustAnchor)
+	if err != nil || len(anchor) != ed25519.PublicKeySize {
+		log.Errorf("roster: invalid trust anchor (want base64 ed25519 public key); roster disabled")
+		return
+	}
+	grace := time.Duration(e.config.RosterGraceSeconds) * time.Second
+	if grace == 0 {
+		grace = defaultRosterGrace
+	}
+
+	store := roster.NewStore(e.config.RosterPath+".lastknowngood", ed25519.PublicKey(anchor), grace, time.Now())
+
+	var active *roster.Roster
+	if data, rerr := os.ReadFile(e.config.RosterPath); rerr == nil {
+		if r, uerr := roster.Unmarshal(data); uerr != nil {
+			log.Warnf("roster: parse %s: %v", e.config.RosterPath, uerr)
+		} else if aerr := store.Accept(r); aerr != nil {
+			log.Warnf("roster: fresh roster rejected (%v); trying last-known-good", aerr)
+		} else {
+			active = r
+			log.Infof("roster: accepted fresh roster (%d peers)", len(r.Peers))
+		}
+	} else {
+		log.Warnf("roster: read %s: %v", e.config.RosterPath, rerr)
+	}
+
+	if active == nil {
+		r, expired, lerr := store.Load()
+		if lerr != nil {
+			log.Errorf("roster: no usable roster (%v); offline island not started", lerr)
+			return
+		}
+		active = r
+		if expired {
+			log.Warn("roster: running in degraded last-known-good mode (expired)")
+		}
+	}
+
+	e.applyRoster(active)
+}
+
+// applyRoster programs static-endpoint roster peers onto the primary interface.
+func (e *Engine) applyRoster(r *roster.Roster) {
+	if e.wgInterface == nil {
+		return
+	}
+	localPub := e.config.WgPrivateKey.PublicKey().String()
+	programmed, awaiting := 0, 0
+	for _, p := range r.Peers {
+		if p.WGPubKey == localPub {
+			continue
+		}
+		if p.Endpoint == "" {
+			awaiting++ // reachable identity known; endpoint awaits discovery
+			continue
+		}
+		allowed, err := parsePrefixes(p.AllowedIPs)
+		if err != nil {
+			log.Warnf("roster peer %s allowedIPs: %v", p.WGPubKey, err)
+			continue
+		}
+		endpoint, err := net.ResolveUDPAddr("udp", p.Endpoint)
+		if err != nil {
+			log.Warnf("roster peer %s endpoint %q: %v", p.WGPubKey, p.Endpoint, err)
+			continue
+		}
+		if err := e.wgInterface.UpdatePeer(p.WGPubKey, allowed, meshPersistentKeepalive, endpoint, e.config.PreSharedKey); err != nil {
+			log.Warnf("roster peer %s program: %v", p.WGPubKey, err)
+			continue
+		}
+		programmed++
+	}
+	log.Infof("roster: applied %d static peer(s); %d awaiting endpoint discovery", programmed, awaiting)
 }
 
 // startBabel starts the babeld routing sidecar when enabled. It runs on the mesh

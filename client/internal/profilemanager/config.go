@@ -180,6 +180,19 @@ type Config struct {
 	// path for multi-link operation until the management server distributes link
 	// configuration. Empty by default (single-link behavior).
 	MeshLinks []MeshLinkConfig
+
+	// RosterPath is the path to a signed peer roster for disconnected ("offline
+	// island") operation. When set, the node bootstraps its mesh from the roster
+	// (validated against RosterTrustAnchor) even with no management server.
+	RosterPath string
+
+	// RosterTrustAnchor is the base64-encoded Ed25519 public key of the roster
+	// authority. Rosters are only accepted if signed by this key.
+	RosterTrustAnchor string
+
+	// RosterGraceSeconds extends roster validity past its expiry (clock-drift /
+	// disconnected slack). 0 uses a safe default.
+	RosterGraceSeconds int
 }
 
 // MeshLinkConfig describes a locally-configured secondary transport link: a
