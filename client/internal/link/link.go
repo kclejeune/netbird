@@ -274,15 +274,22 @@ func (m *Manager) IsMultiLink() bool {
 	return m.LinkCount() > 1
 }
 
-// SelectLink chooses the best interface-link for reaching a peer.
+// latencyHysteresisMs is the QoS margin (in the health score's units) by which a
+// same-priority candidate must beat the current selection before we switch, so
+// selection doesn't flap on tiny latency jitter.
+const latencyHysteresisMs = 15
+
+// SelectLink chooses the best interface-link for reaching a peer (QoS-aware).
 //
 //   - If the peer has reachability entries, the candidate links are exactly
 //     those it is reachable on. Otherwise (the common ICE-peer case) the
 //     candidate is the primary link — preserving single-link behavior.
-//   - Among candidates that exist and are Up, the lowest Priority wins.
-//   - The prior selection is reused only if it is still among the best (up and
-//     no strictly-higher-priority candidate is up), so a recovered
-//     higher-priority link is picked up instead of sticking to a worse one.
+//   - Among up candidates, the lowest Priority wins; ties break on observed
+//     health (latency + loss) from the LinkMonitor, so the healthier path is
+//     preferred. This is the QoS path-selection input.
+//   - The prior selection is kept unless a candidate is meaningfully better: a
+//     strictly-higher-priority link always wins; a same-priority link must beat
+//     the current one by more than the hysteresis margin.
 func (m *Manager) SelectLink(peerPubKey string) *Link {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -294,9 +301,8 @@ func (m *Manager) SelectLink(peerPubKey string) *Link {
 		return nil
 	}
 
-	// Honor the cache only if the cached link is still exactly the best.
 	if cachedID, ok := m.byPeer[peerPubKey]; ok {
-		if cached, ok := m.links[cachedID]; ok && cached.State().Up && cached.Priority <= best.Priority {
+		if cached, ok := m.links[cachedID]; ok && cached.State().Up && !shouldSwitch(cached, best) {
 			return cached
 		}
 	}
@@ -323,18 +329,43 @@ func (m *Manager) candidateLinksLocked(peerPubKey string) []*Link {
 	return out
 }
 
-// bestUpLink returns the up link with the lowest Priority, or nil.
+// linkScore returns a QoS ordering key: (priority, healthPenalty), both
+// lower-is-better. Priority is immutable after registration; the health penalty
+// is derived from the mutex-protected LinkState, so this is race-free. Loss is
+// weighted heavily since it hurts throughput more than latency.
+func linkScore(l *Link) (uint32, uint64) {
+	st := l.State()
+	penalty := uint64(st.LatencyMs) + uint64(st.LossPercent)*10
+	return l.Priority, penalty
+}
+
+// bestUpLink returns the up link with the best (priority, health) score.
 func bestUpLink(links []*Link) *Link {
 	var best *Link
+	var bestPrio uint32
+	var bestPen uint64
 	for _, l := range links {
 		if !l.State().Up {
 			continue
 		}
-		if best == nil || l.Priority < best.Priority {
-			best = l
+		p, pen := linkScore(l)
+		if best == nil || p < bestPrio || (p == bestPrio && pen < bestPen) {
+			best, bestPrio, bestPen = l, p, pen
 		}
 	}
 	return best
+}
+
+// shouldSwitch reports whether cand should replace cur: a strictly-higher
+// priority (lower value) always switches; a same-priority candidate switches
+// only if it beats cur by more than the hysteresis margin.
+func shouldSwitch(cur, cand *Link) bool {
+	pcur, hcur := linkScore(cur)
+	pcand, hcand := linkScore(cand)
+	if pcand != pcur {
+		return pcand < pcur
+	}
+	return hcand+latencyHysteresisMs < hcur
 }
 
 // InvalidatePeerCache drops a peer's cached selection, forcing re-evaluation.

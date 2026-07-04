@@ -316,3 +316,57 @@ func TestClose_ReturnsFirstOwnedError(t *testing.T) {
 		t.Fatal("expected error from owned link Close")
 	}
 }
+
+// --- QoS (latency-aware) selection ----------------------------------------
+
+func TestSelectLink_QoSLatencyTiebreak(t *testing.T) {
+	mgr := NewManager(&mockIface{name: "wg0"})
+	// Two same-priority links; healthier (lower latency) should win.
+	fast := &Link{ID: "fast", Priority: 5, Iface: &mockIface{name: "wf"}, state: LinkState{Up: true, LatencyMs: 20}}
+	slow := &Link{ID: "slow", Priority: 5, Iface: &mockIface{name: "ws"}, state: LinkState{Up: true, LatencyMs: 120}}
+	mgr.RegisterInterfaceLink(fast)
+	mgr.RegisterInterfaceLink(slow)
+	mgr.SetPeerLinks("p", []PeerLink{{LinkID: "slow"}, {LinkID: "fast"}})
+
+	if sel := mgr.SelectLink("p"); sel == nil || sel.ID != "fast" {
+		t.Fatalf("expected lower-latency 'fast', got %v", sel)
+	}
+}
+
+func TestSelectLink_QoSPriorityBeatsLatency(t *testing.T) {
+	mgr := NewManager(&mockIface{name: "wg0"})
+	// Higher priority (lower number) wins even with worse latency.
+	prio := &Link{ID: "prio", Priority: 1, Iface: &mockIface{name: "wp"}, state: LinkState{Up: true, LatencyMs: 200}}
+	fast := &Link{ID: "fast", Priority: 9, Iface: &mockIface{name: "wf"}, state: LinkState{Up: true, LatencyMs: 10}}
+	mgr.RegisterInterfaceLink(prio)
+	mgr.RegisterInterfaceLink(fast)
+	mgr.SetPeerLinks("p", []PeerLink{{LinkID: "fast"}, {LinkID: "prio"}})
+
+	if sel := mgr.SelectLink("p"); sel == nil || sel.ID != "prio" {
+		t.Fatalf("expected higher-priority 'prio' despite worse latency, got %v", sel)
+	}
+}
+
+func TestSelectLink_QoSHysteresisNoFlap(t *testing.T) {
+	mgr := NewManager(&mockIface{name: "wg0"})
+	a := &Link{ID: "a", Priority: 5, Iface: &mockIface{name: "wa"}, state: LinkState{Up: true, LatencyMs: 50}}
+	b := &Link{ID: "b", Priority: 5, Iface: &mockIface{name: "wb"}, state: LinkState{Up: true, LatencyMs: 55}}
+	mgr.RegisterInterfaceLink(a)
+	mgr.RegisterInterfaceLink(b)
+	mgr.SetPeerLinks("p", []PeerLink{{LinkID: "a"}, {LinkID: "b"}})
+
+	// Initial pick: a (50 < 55).
+	if sel := mgr.SelectLink("p"); sel.ID != "a" {
+		t.Fatalf("expected 'a', got %s", sel.ID)
+	}
+	// b improves slightly (48) — within hysteresis (15), must NOT flap.
+	b.UpdateState(LinkState{Up: true, LatencyMs: 48})
+	if sel := mgr.SelectLink("p"); sel.ID != "a" {
+		t.Fatalf("hysteresis: should stay on 'a', got %s", sel.ID)
+	}
+	// b improves a lot (20, beats a's 50 by > 15) — now switch.
+	b.UpdateState(LinkState{Up: true, LatencyMs: 20})
+	if sel := mgr.SelectLink("p"); sel.ID != "b" {
+		t.Fatalf("should switch to markedly-better 'b', got %s", sel.ID)
+	}
+}
