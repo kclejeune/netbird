@@ -455,6 +455,14 @@ func setupConfig(customDNSAddressConverted []byte, cmd *cobra.Command, configFil
 		ic.RosenpassPermissive = &rosenpassPermissive
 	}
 
+	if cmd.Flag(cipherTypeFlag).Changed {
+		ic.CipherType = &cipherType
+	}
+
+	if cmd.Flag(enableBabelFlag).Changed {
+		ic.BabelEnabled = &babelEnabled
+	}
+
 	if cmd.Flag(serverSSHAllowedFlag).Changed {
 		ic.ServerSSHAllowed = &serverSSHAllowed
 	}

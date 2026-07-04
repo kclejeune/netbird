@@ -12,13 +12,28 @@ type CipherType string
 
 const (
 	// CipherTypeNaCl uses Curve25519 + XSalsa20-Poly1305 (NaCl box). This is the
-	// original NetBird encryption scheme. NOT FIPS-compliant.
+	// original NetBird encryption scheme. NOT FIPS-approved. Its wire format is
+	// untagged and byte-compatible with upstream NetBird, so a client left on the
+	// default cipher interoperates with a stock management/signal server.
 	CipherTypeNaCl CipherType = "nacl"
 
-	// CipherTypeAESGCM uses ECDH-P256 key agreement with AES-256-GCM authenticated
-	// encryption. FIPS 140-compliant when built with a validated crypto module.
+	// CipherTypeAESGCM uses X25519 ECDH key agreement, a SHA-256 KDF, and
+	// AES-256-GCM authenticated encryption.
+	//
+	// IMPORTANT: this is NOT end-to-end FIPS-approved. The AES-256-GCM and SHA-256
+	// primitives are FIPS-approved, but X25519 key agreement is not on the
+	// SP 800-56A approved-curve list. Full FIPS key agreement (P-256 ECDH with
+	// dedicated keys) is deferred to the FIPS data-plane stage. Treat this cipher
+	// as "AES-GCM control-plane encryption", not as a FIPS compliance claim.
 	CipherTypeAESGCM CipherType = "aesgcm"
 )
+
+// cipherTagAESGCM is the 1-byte wire tag prepended by AESGCMCipher. It lets a
+// misconfigured peer (one side nacl, the other aesgcm) fail loudly instead of
+// producing an opaque AEAD error, and reserves room for future format
+// revisions. NaCl intentionally carries no tag to stay wire-compatible with
+// upstream NetBird.
+const cipherTagAESGCM byte = 0x01
 
 // Cipher provides authenticated encryption between two peers identified by
 // WireGuard (Curve25519) key pairs.

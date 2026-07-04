@@ -23,16 +23,18 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	// DefaultSocketPath is the default babeld local control socket path.
+	// DefaultSocketPath is babeld's local read-write control socket
+	// (local-path-readwrite). Distinct from the state file.
 	DefaultSocketPath = "/var/run/babel.sock"
 
-	// DefaultConfigDir is the directory for babeld configuration files.
+	// DefaultConfigDir is the directory for the generated config and state file.
 	DefaultConfigDir = "/etc/babel"
 
 	// DefaultBabelBinary is the default path to the babeld binary.
@@ -43,6 +45,15 @@ const (
 
 	// DefaultUpdateInterval is the default route update interval in seconds.
 	DefaultUpdateInterval = 16
+
+	// DefaultExportTable is the dedicated kernel routing table babeld exports its
+	// routes into, so it does not fight NetBird's own route installer (which uses
+	// its own table). Chosen distinct from NetBird's NetbirdVPNTableID (0x1BD0).
+	DefaultExportTable = 100
+
+	// DefaultMeshPrefix is the address range whose routes babeld redistributes
+	// (NetBird's CGNAT range). Everything else is denied.
+	DefaultMeshPrefix = "100.64.0.0/10"
 )
 
 // Config holds the configuration for the Babel manager.
@@ -53,10 +64,10 @@ type Config struct {
 	// BinaryPath is the path to the babeld binary. Defaults to "babeld".
 	BinaryPath string
 
-	// SocketPath is the path to the babeld control socket.
+	// SocketPath is babeld's local read-write control socket (local-path-readwrite).
 	SocketPath string
 
-	// ConfigDir is the directory for generated babeld config files.
+	// ConfigDir is the directory for the generated config and state file.
 	ConfigDir string
 
 	// HelloInterval is the Hello message interval in seconds.
@@ -65,14 +76,22 @@ type Config struct {
 	// UpdateInterval is the route update interval in seconds.
 	UpdateInterval int
 
-	// RouterID is the router identifier. If empty, babeld will auto-generate one.
+	// RouterID is the router identifier. If empty, babeld derives one and the
+	// state file keeps it stable across restarts.
 	RouterID string
 
-	// Interfaces lists the WireGuard interface names to register with babeld.
+	// Interfaces lists the WireGuard interface names babeld runs on (as tunnels).
 	Interfaces []string
 
 	// RedistributeLocal controls whether local routes are redistributed.
 	RedistributeLocal bool
+
+	// ExportTable is the dedicated kernel table babeld installs routes into.
+	ExportTable int
+
+	// MeshPrefix is the prefix whose routes are redistributed (allow); all others
+	// are denied.
+	MeshPrefix string
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -84,6 +103,8 @@ func DefaultConfig() Config {
 		ConfigDir:      DefaultConfigDir,
 		HelloInterval:  DefaultHelloInterval,
 		UpdateInterval: DefaultUpdateInterval,
+		ExportTable:    DefaultExportTable,
+		MeshPrefix:     DefaultMeshPrefix,
 	}
 }
 
@@ -151,6 +172,12 @@ func NewManager(cfg Config) *Manager {
 	if cfg.UpdateInterval == 0 {
 		cfg.UpdateInterval = DefaultUpdateInterval
 	}
+	if cfg.ExportTable == 0 {
+		cfg.ExportTable = DefaultExportTable
+	}
+	if cfg.MeshPrefix == "" {
+		cfg.MeshPrefix = DefaultMeshPrefix
+	}
 
 	return &Manager{
 		config:     cfg,
@@ -179,10 +206,12 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("babeld is already running")
 	}
 
-	// Verify babeld binary exists.
+	// babeld-not-installed is non-fatal: mesh routing simply stays inactive. This
+	// keeps a node usable in the field even when the sidecar is unavailable.
 	binaryPath, err := exec.LookPath(m.config.BinaryPath)
 	if err != nil {
-		return fmt.Errorf("babeld binary not found at %q: %w", m.config.BinaryPath, err)
+		log.Warnf("babel enabled but babeld binary %q not found (%v); mesh routing disabled", m.config.BinaryPath, err)
+		return nil
 	}
 
 	// Generate configuration file.
@@ -231,10 +260,9 @@ func (m *Manager) Stop() error {
 	}
 
 	if m.cmd != nil && m.cmd.Process != nil {
-		// Send SIGTERM first for graceful shutdown.
-		if err := m.cmd.Process.Signal(os.Interrupt); err != nil {
+		// SIGTERM for a graceful shutdown; babeld retracts its routes on exit.
+		if err := m.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			log.Warnf("failed to send SIGTERM to babeld: %v", err)
-			// Force kill.
 			_ = m.cmd.Process.Kill()
 		}
 	}
@@ -269,43 +297,26 @@ func (m *Manager) GetNeighbours() ([]NeighbourEntry, error) {
 	return queryNeighbours(socketPath)
 }
 
-// AddInterface tells babeld to monitor a new interface.
+// AddInterface asks babeld (via the read-write local socket) to start running on
+// an interface as a tunnel. Interfaces present at startup are in the generated
+// config; this covers links created after babeld is already up.
 func (m *Manager) AddInterface(ifaceName string) error {
 	return m.sendCommand(fmt.Sprintf("interface %s type tunnel", ifaceName))
 }
 
-// RemoveInterface tells babeld to stop monitoring an interface.
+// RemoveInterface asks babeld to stop running on an interface. babeld's runtime
+// interface teardown is best-effort via the local socket; the authoritative
+// path is regenerating the config, so failures here are non-fatal to the caller.
 func (m *Manager) RemoveInterface(ifaceName string) error {
-	return m.sendCommand(fmt.Sprintf("unmonitor %s", ifaceName))
+	return m.sendCommand(fmt.Sprintf("flush interface %s", ifaceName))
 }
 
-// buildArgs constructs the babeld command-line arguments.
+// buildArgs constructs the babeld command line. Everything of substance lives in
+// the generated config file (unambiguous directive syntax); we only point babeld
+// at it. babeld runs in the foreground by default (no -D), so exec's Wait blocks
+// for the real process lifetime and this Manager can supervise it correctly.
 func (m *Manager) buildArgs(configPath string) []string {
-	args := []string{
-		"-c", configPath,
-		"-S", m.socketPath, // local control socket
-		"-C", fmt.Sprintf("hello-interval %d", m.config.HelloInterval),
-		"-C", fmt.Sprintf("update-interval %d", m.config.UpdateInterval),
-		"-D",  // run in foreground (we manage the process)
-		"-r",  // do not read kernel routes at startup
-		"-G", "0", // no grace period
-	}
-
-	if m.config.RouterID != "" {
-		args = append(args, "-C", fmt.Sprintf("router-id %s", m.config.RouterID))
-	}
-
-	if !m.config.RedistributeLocal {
-		args = append(args, "-C", "redistribute local deny")
-	}
-
-	// Add interfaces.
-	for _, iface := range m.config.Interfaces {
-		// "type tunnel" disables split-horizon which is appropriate for WG tunnels.
-		args = append(args, "-C", fmt.Sprintf("interface %s type tunnel", iface))
-	}
-
-	return args
+	return []string{"-c", configPath}
 }
 
 // generateConfig writes a babeld configuration file.
@@ -315,18 +326,33 @@ func (m *Manager) generateConfig() (string, error) {
 	}
 
 	configPath := filepath.Join(m.config.ConfigDir, "babel.conf")
+	stateFile := filepath.Join(m.config.ConfigDir, "babel.state")
 
 	var sb strings.Builder
-	sb.WriteString("# Auto-generated by TacMesh. Do not edit.\n\n")
+	sb.WriteString("# Auto-generated by TacMesh. Do not edit.\n")
 
-	// Default filters: allow mesh prefixes, deny everything else.
-	sb.WriteString("# Redistribute only NetBird mesh routes\n")
-	sb.WriteString("redistribute ip 100.64.0.0/10 allow\n")
-	sb.WriteString("redistribute local deny\n\n")
+	// Keep router-id/seqno stable across restarts.
+	fmt.Fprintf(&sb, "state-file \"%s\"\n", stateFile)
+	// Read-write local socket for dump/monitor and runtime interface changes.
+	fmt.Fprintf(&sb, "local-path-readwrite \"%s\"\n", m.socketPath)
+	// Install routes into a dedicated table so we don't fight NetBird's installer.
+	fmt.Fprintf(&sb, "export-table %d\n", m.config.ExportTable)
+	if m.config.RouterID != "" {
+		fmt.Fprintf(&sb, "router-id %s\n", m.config.RouterID)
+	}
 
-	// Interface configurations.
+	// Redistribute only the mesh prefix; deny local (and everything else).
+	fmt.Fprintf(&sb, "redistribute ip %s allow\n", m.config.MeshPrefix)
+	if !m.config.RedistributeLocal {
+		sb.WriteString("redistribute local deny\n")
+	}
+	sb.WriteString("redistribute deny\n")
+
+	// Per-interface config. "type tunnel" disables split-horizon, correct for
+	// point-to-point WireGuard tunnels. Intervals are in seconds.
 	for _, iface := range m.config.Interfaces {
-		sb.WriteString(fmt.Sprintf("interface %s type tunnel\n", iface))
+		fmt.Fprintf(&sb, "interface %s type tunnel hello-interval %d update-interval %d\n",
+			iface, m.config.HelloInterval, m.config.UpdateInterval)
 	}
 
 	if err := os.WriteFile(configPath, []byte(sb.String()), 0o644); err != nil {

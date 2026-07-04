@@ -85,6 +85,12 @@ type ConfigInput struct {
 	LazyConnectionEnabled *bool
 
 	MTU *uint16
+
+	// CipherType selects the management/signal encryption cipher ("nacl" or "aesgcm").
+	CipherType *string
+
+	// BabelEnabled toggles the babeld routing sidecar for mesh links.
+	BabelEnabled *bool
 }
 
 // Config Configuration type
@@ -161,8 +167,48 @@ type Config struct {
 	MTU uint16
 
 	// CipherType selects the encryption algorithm for management/signal communication.
-	// Valid values: "nacl" (default, backward compatible) or "aesgcm" (FIPS-compliant).
+	// Valid values: "" or "nacl" (default, upstream-compatible) or "aesgcm"
+	// (X25519 ECDH + AES-256-GCM; see encryption package for FIPS caveats).
 	CipherType string
+
+	// BabelEnabled turns on the babeld routing sidecar for mesh links. Disabled
+	// by default; requires the babeld binary to be installed (Linux only).
+	BabelEnabled bool
+
+	// MeshLinks defines locally-configured secondary transport links (e.g. a radio
+	// or LAN interface) and their static WireGuard peers. This is the local-config
+	// path for multi-link operation until the management server distributes link
+	// configuration. Empty by default (single-link behavior).
+	MeshLinks []MeshLinkConfig
+}
+
+// MeshLinkConfig describes a locally-configured secondary transport link: a
+// dedicated WireGuard interface plus the static peers reachable over it.
+type MeshLinkConfig struct {
+	// ID is the link identifier used by the LinkManager (e.g. "mesh0").
+	ID string
+	// InterfaceName is the WireGuard interface to create for this link.
+	InterfaceName string
+	// ListenPort is the WireGuard listen port for this interface.
+	ListenPort int
+	// Address is the local interface address in CIDR form (e.g. "100.71.0.1/24").
+	Address string
+	// MTU is the interface MTU (0 = default).
+	MTU uint16
+	// Priority for path selection (lower = preferred). The default link is 0.
+	Priority uint32
+	// Peers are the static WireGuard peers reachable over this link.
+	Peers []MeshPeerConfig
+}
+
+// MeshPeerConfig is a static WireGuard peer on a mesh link (no ICE/signal).
+type MeshPeerConfig struct {
+	// PublicKey is the peer's WireGuard public key (base64).
+	PublicKey string
+	// Endpoint is the peer's static host:port endpoint.
+	Endpoint string
+	// AllowedIPs are the CIDRs routed to this peer.
+	AllowedIPs []string
 }
 
 var ConfigDirOverride string
@@ -336,6 +382,18 @@ func (config *Config) apply(input ConfigInput) (updated bool, err error) {
 	if input.RosenpassPermissive != nil && *input.RosenpassPermissive != config.RosenpassPermissive {
 		log.Infof("switching Rosenpass permissive to %t", *input.RosenpassPermissive)
 		config.RosenpassPermissive = *input.RosenpassPermissive
+		updated = true
+	}
+
+	if input.CipherType != nil && *input.CipherType != config.CipherType {
+		log.Infof("switching cipher type to %q", *input.CipherType)
+		config.CipherType = *input.CipherType
+		updated = true
+	}
+
+	if input.BabelEnabled != nil && *input.BabelEnabled != config.BabelEnabled {
+		log.Infof("switching Babel routing to %t", *input.BabelEnabled)
+		config.BabelEnabled = *input.BabelEnabled
 		updated = true
 	}
 

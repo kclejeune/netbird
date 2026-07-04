@@ -16,23 +16,26 @@ const (
 	aesgcmTagSize   = 16 // AES-GCM authentication tag
 )
 
-// AESGCMCipher implements Cipher using ECDH-P256 key agreement with AES-256-GCM
-// authenticated encryption. All primitives are FIPS 140-approved.
+// AESGCMCipher implements Cipher using X25519 ECDH key agreement, a SHA-256 KDF,
+// and AES-256-GCM authenticated encryption, keyed from the peers' WireGuard
+// (Curve25519) key pairs.
 //
-// WireGuard keys (Curve25519) cannot be used directly with P-256. Instead, the
-// Curve25519 shared secret is derived via X25519 (same as NaCl box internally)
-// and then passed through SHA-256 to produce the AES-256 key. This means:
-//   - Key agreement still uses X25519/Curve25519 (the WireGuard key pair).
-//   - The symmetric encryption uses AES-256-GCM (FIPS-approved).
-//   - Key derivation uses SHA-256 (FIPS-approved).
+// FIPS status: NOT end-to-end FIPS-approved. AES-256-GCM and SHA-256 are
+// FIPS-approved primitives, but X25519 key agreement is not on the SP 800-56A
+// approved-curve list, so this cipher does not by itself satisfy FIPS 140. Full
+// FIPS key agreement (P-256 ECDH with dedicated keys) is deferred to the FIPS
+// data-plane stage. If the binary is built against a FIPS-validated Go crypto
+// module the AES-GCM/SHA-256 operations will use the validated implementations,
+// but the key-agreement step still would not qualify.
 //
-// For full FIPS compliance of the key agreement step, the caller should use
-// P-256 ECDH keys instead of WireGuard keys. This cipher supports both modes:
-// when WireGuard keys are provided, X25519 is used for agreement; if the build
-// uses a FIPS-validated Go crypto module, the symmetric operations (AES-GCM,
-// SHA-256) will use the validated implementations.
+// The shared secret is derived once per message via X25519 and hashed with
+// SHA-256 into the AES-256 key. This is static-static ECDH: the per-pair key is
+// deterministic and long-lived (no forward secrecy). NIST caps random-96-bit
+// nonce GCM at 2^32 messages per key; that is far beyond the control-plane
+// message volume this cipher carries, but the ceiling is documented here for
+// completeness.
 //
-// Wire format: [12-byte nonce][ciphertext + 16-byte GCM tag]
+// Wire format: [1-byte tag=cipherTagAESGCM][12-byte nonce][ciphertext + 16-byte GCM tag]
 type AESGCMCipher struct{}
 
 func (c *AESGCMCipher) Type() CipherType {
@@ -45,20 +48,31 @@ func (c *AESGCMCipher) Encrypt(msg []byte, peerPublicKey wgtypes.Key, privateKey
 		return nil, fmt.Errorf("derive AEAD for encryption: %w", err)
 	}
 
-	nonce := make([]byte, aesgcmNonceSize)
+	// Prefix a 1-byte cipher tag so a nacl/aesgcm misconfiguration fails loudly
+	// and future format revisions remain distinguishable. Layout:
+	// [tag][nonce][ciphertext+GCM tag].
+	out := make([]byte, 1+aesgcmNonceSize, 1+aesgcmNonceSize+len(msg)+aesgcmTagSize)
+	out[0] = cipherTagAESGCM
+	nonce := out[1 : 1+aesgcmNonceSize]
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("generate nonce: %w", err)
 	}
 
-	// Seal appends ciphertext+tag to nonce, so the result is [nonce][ciphertext][tag].
-	sealed := aead.Seal(nonce, nonce, msg, nil)
+	// Seal appends ciphertext+tag after the nonce, giving [tag][nonce][ct+tag].
+	sealed := aead.Seal(out, nonce, msg, nil)
 	return sealed, nil
 }
 
 func (c *AESGCMCipher) Decrypt(encryptedMsg []byte, peerPublicKey wgtypes.Key, privateKey wgtypes.Key) ([]byte, error) {
-	minLen := aesgcmNonceSize + aesgcmTagSize
+	minLen := 1 + aesgcmNonceSize + aesgcmTagSize
 	if len(encryptedMsg) < minLen {
 		return nil, fmt.Errorf("invalid encrypted message length: got %d, need at least %d", len(encryptedMsg), minLen)
+	}
+
+	if encryptedMsg[0] != cipherTagAESGCM {
+		// Most likely a cipher mismatch (peer sent NaCl, or a future/unknown
+		// AES-GCM format). Fail loudly rather than mangle the AEAD.
+		return nil, fmt.Errorf("aesgcm: unexpected cipher tag 0x%02x (peer cipher mismatch?)", encryptedMsg[0])
 	}
 
 	aead, err := c.deriveAEAD(peerPublicKey, privateKey)
@@ -66,8 +80,8 @@ func (c *AESGCMCipher) Decrypt(encryptedMsg []byte, peerPublicKey wgtypes.Key, p
 		return nil, fmt.Errorf("derive AEAD for decryption: %w", err)
 	}
 
-	nonce := encryptedMsg[:aesgcmNonceSize]
-	ciphertext := encryptedMsg[aesgcmNonceSize:]
+	nonce := encryptedMsg[1 : 1+aesgcmNonceSize]
+	ciphertext := encryptedMsg[1+aesgcmNonceSize:]
 
 	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
@@ -95,7 +109,10 @@ func (c *AESGCMCipher) deriveAEAD(peerPublicKey wgtypes.Key, privateKey wgtypes.
 		return nil, fmt.Errorf("X25519 key agreement: %w", err)
 	}
 
-	// Derive AES-256 key from shared secret using SHA-256 (FIPS-approved KDF).
+	// Derive the AES-256 key by hashing the X25519 shared secret with SHA-256.
+	// This is a single-purpose KDF (no salt/info); adequate for one fixed key per
+	// peer pair. SHA-256 is FIPS-approved; the X25519 agreement that produced the
+	// secret is not (see the type doc).
 	aesKey := sha256.Sum256(sharedSecret)
 
 	block, err := aes.NewCipher(aesKey[:])

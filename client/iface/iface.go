@@ -76,6 +76,11 @@ type WGIface struct {
 	configurer     device.WGConfigurer
 	filter         device.PacketFilter
 	wgProxyFactory wgProxyFactory
+
+	// closed guards Close against being run more than once. The proxy factory
+	// Free and tun Close are not themselves idempotent, so a second Close would
+	// double-free; this makes Close safe to call repeatedly.
+	closed bool
 }
 
 func (w *WGIface) GetProxy() wgproxy.Proxy {
@@ -218,6 +223,11 @@ func (w *WGIface) RemoveAllowedIP(peerKey string, allowedIP netip.Prefix) error 
 func (w *WGIface) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.closed {
+		return nil
+	}
+	w.closed = true
 
 	var result *multierror.Error
 

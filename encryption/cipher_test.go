@@ -311,3 +311,36 @@ func testCipher(t *testing.T, c encryption.Cipher) {
 		}
 	})
 }
+
+// TestAESGCMWireTag verifies the AES-GCM wire format carries the cipher tag as
+// its first byte, and that a tag mismatch (e.g. a NaCl-format message fed to the
+// AES-GCM decryptor) fails loudly with a tag error rather than an opaque AEAD
+// failure.
+func TestAESGCMWireTag(t *testing.T) {
+	senderKey, _ := wgtypes.GenerateKey()
+	receiverKey, _ := wgtypes.GenerateKey()
+
+	aesgcm := &encryption.AESGCMCipher{}
+	nacl := &encryption.NaClCipher{}
+
+	enc, err := aesgcm.Encrypt([]byte("tagged payload"), receiverKey.PublicKey(), senderKey)
+	if err != nil {
+		t.Fatalf("AES-GCM Encrypt: %v", err)
+	}
+	if len(enc) == 0 || enc[0] != 0x01 {
+		t.Fatalf("expected first byte to be AES-GCM tag 0x01, got % x", enc)
+	}
+
+	// A NaCl-format message starts with a 24-byte nonce whose first byte is
+	// almost never 0x01; feeding it to the AES-GCM decryptor must fail on the tag
+	// check, not silently mis-derive.
+	naclMsg, err := nacl.Encrypt([]byte("nacl payload"), receiverKey.PublicKey(), senderKey)
+	if err != nil {
+		t.Fatalf("NaCl Encrypt: %v", err)
+	}
+	// Force a definite mismatch by clearing the first byte to something != tag.
+	naclMsg[0] = 0x00
+	if _, err := aesgcm.Decrypt(naclMsg, senderKey.PublicKey(), receiverKey); err == nil {
+		t.Fatal("expected AES-GCM decrypt to reject a non-tagged message")
+	}
+}

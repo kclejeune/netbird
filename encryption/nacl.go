@@ -12,6 +12,11 @@ const naclNonceSize = 24
 
 // NaClCipher implements Cipher using NaCl box (Curve25519 + XSalsa20-Poly1305).
 // This is the original NetBird encryption scheme.
+//
+// Its wire format is intentionally untagged — [24-byte nonce][box] — so that a
+// client on the default cipher stays byte-compatible with an upstream NetBird
+// management/signal server. Tagged formats (see cipherTagAESGCM) are used only
+// by non-default ciphers.
 type NaClCipher struct{}
 
 func (c *NaClCipher) Type() CipherType {

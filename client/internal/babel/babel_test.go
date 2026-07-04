@@ -57,112 +57,90 @@ func TestNewManager_CustomConfig(t *testing.T) {
 	}
 }
 
+// TestBuildArgs verifies babeld is invoked config-file-driven and in the
+// foreground (no -D, no flag soup) so the supervising Wait is meaningful.
 func TestBuildArgs(t *testing.T) {
-	mgr := NewManager(Config{
-		SocketPath:        "/tmp/babel.sock",
-		HelloInterval:     2,
-		UpdateInterval:    8,
-		RouterID:          "1.2.3.4",
-		Interfaces:        []string{"wg0", "wg-silvus"},
-		RedistributeLocal: false,
-	})
-
+	mgr := NewManager(Config{Interfaces: []string{"wg0"}})
 	args := mgr.buildArgs("/etc/babel/babel.conf")
 
-	// Verify key arguments are present.
+	if len(args) != 2 || args[0] != "-c" || args[1] != "/etc/babel/babel.conf" {
+		t.Fatalf("expected [-c <path>], got %v", args)
+	}
 	argStr := strings.Join(args, " ")
-
-	if !strings.Contains(argStr, "-c /etc/babel/babel.conf") {
-		t.Fatal("missing config file argument")
-	}
-	if !strings.Contains(argStr, "-S /tmp/babel.sock") {
-		t.Fatal("missing socket path argument")
-	}
-	if !strings.Contains(argStr, "hello-interval 2") {
-		t.Fatal("missing hello-interval")
-	}
-	if !strings.Contains(argStr, "update-interval 8") {
-		t.Fatal("missing update-interval")
-	}
-	if !strings.Contains(argStr, "router-id 1.2.3.4") {
-		t.Fatal("missing router-id")
-	}
-	if !strings.Contains(argStr, "redistribute local deny") {
-		t.Fatal("missing redistribute local deny")
-	}
-	if !strings.Contains(argStr, "interface wg0 type tunnel") {
-		t.Fatal("missing wg0 interface")
-	}
-	if !strings.Contains(argStr, "interface wg-silvus type tunnel") {
-		t.Fatal("missing wg-silvus interface")
-	}
-	if !strings.Contains(argStr, "-D") {
-		t.Fatal("missing foreground flag")
-	}
-}
-
-func TestBuildArgs_NoRouterID(t *testing.T) {
-	mgr := NewManager(Config{
-		HelloInterval:  4,
-		UpdateInterval: 16,
-	})
-
-	args := mgr.buildArgs("/etc/babel/babel.conf")
-	argStr := strings.Join(args, " ")
-
-	if strings.Contains(argStr, "router-id") {
-		t.Fatal("should not include router-id when empty")
-	}
-}
-
-func TestBuildArgs_RedistributeLocal(t *testing.T) {
-	mgr := NewManager(Config{
-		RedistributeLocal: true,
-	})
-
-	args := mgr.buildArgs("/etc/babel/babel.conf")
-	argStr := strings.Join(args, " ")
-
-	if strings.Contains(argStr, "redistribute local deny") {
-		t.Fatal("should not deny local redistribution when RedistributeLocal is true")
+	for _, bad := range []string{"-D", "-S ", "-G", "-r"} {
+		if strings.Contains(argStr, bad) {
+			t.Fatalf("args must not contain %q (moved to config file): %v", bad, args)
+		}
 	}
 }
 
 func TestGenerateConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	mgr := NewManager(Config{
-		ConfigDir:  tmpDir,
-		Interfaces: []string{"wg0", "wg-manet"},
+		ConfigDir:      tmpDir,
+		SocketPath:     filepath.Join(tmpDir, "babel.sock"),
+		HelloInterval:  2,
+		UpdateInterval: 8,
+		RouterID:       "1.2.3.4",
+		ExportTable:    123,
+		MeshPrefix:     "100.64.0.0/10",
+		Interfaces:     []string{"wg0", "wg-manet"},
 	})
 
 	configPath, err := mgr.generateConfig()
 	if err != nil {
 		t.Fatalf("generateConfig: %v", err)
 	}
-
-	expectedPath := filepath.Join(tmpDir, "babel.conf")
-	if configPath != expectedPath {
-		t.Fatalf("expected config path %q, got %q", expectedPath, configPath)
+	if configPath != filepath.Join(tmpDir, "babel.conf") {
+		t.Fatalf("unexpected config path %q", configPath)
 	}
 
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatalf("read config file: %v", err)
 	}
+	cfg := string(content)
 
-	configStr := string(content)
+	wants := []string{
+		"state-file ",
+		"local-path-readwrite \"" + filepath.Join(tmpDir, "babel.sock") + "\"",
+		"export-table 123",
+		"router-id 1.2.3.4",
+		"redistribute ip 100.64.0.0/10 allow",
+		"redistribute local deny",
+		"interface wg0 type tunnel hello-interval 2 update-interval 8",
+		"interface wg-manet type tunnel hello-interval 2 update-interval 8",
+	}
+	for _, w := range wants {
+		if !strings.Contains(cfg, w) {
+			t.Fatalf("config missing %q\n---\n%s", w, cfg)
+		}
+	}
+}
 
-	if !strings.Contains(configStr, "interface wg0 type tunnel") {
-		t.Fatal("config should contain wg0 interface")
+func TestGenerateConfig_RedistributeLocalAllowed(t *testing.T) {
+	tmpDir := t.TempDir()
+	mgr := NewManager(Config{ConfigDir: tmpDir, RedistributeLocal: true, Interfaces: []string{"wg0"}})
+	path, err := mgr.generateConfig()
+	if err != nil {
+		t.Fatalf("generateConfig: %v", err)
 	}
-	if !strings.Contains(configStr, "interface wg-manet type tunnel") {
-		t.Fatal("config should contain wg-manet interface")
+	content, _ := os.ReadFile(path)
+	if strings.Contains(string(content), "redistribute local deny") {
+		t.Fatal("should not deny local redistribution when RedistributeLocal is true")
 	}
-	if !strings.Contains(configStr, "redistribute ip 100.64.0.0/10 allow") {
-		t.Fatal("config should contain mesh prefix redistribution rule")
+}
+
+func TestGenerateConfig_NoRouterID(t *testing.T) {
+	tmpDir := t.TempDir()
+	mgr := NewManager(Config{ConfigDir: tmpDir, Interfaces: []string{"wg0"}})
+	path, err := mgr.generateConfig()
+	if err != nil {
+		t.Fatalf("generateConfig: %v", err)
 	}
-	if !strings.Contains(configStr, "redistribute local deny") {
-		t.Fatal("config should contain local deny rule")
+	content, _ := os.ReadFile(path)
+	if strings.Contains(string(content), "router-id ") {
+		t.Fatal("should not emit router-id when empty")
 	}
 }
 

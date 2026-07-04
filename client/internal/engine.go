@@ -32,12 +32,14 @@ import (
 	nbnetstack "github.com/netbirdio/netbird/client/iface/netstack"
 	"github.com/netbirdio/netbird/client/iface/udpmux"
 	"github.com/netbirdio/netbird/client/internal/acl"
+	"github.com/netbirdio/netbird/client/internal/babel"
 	"github.com/netbirdio/netbird/client/internal/debug"
 	"github.com/netbirdio/netbird/client/internal/dns"
 	dnsconfig "github.com/netbirdio/netbird/client/internal/dns/config"
 	"github.com/netbirdio/netbird/client/internal/dnsfwd"
 	"github.com/netbirdio/netbird/client/internal/expose"
 	"github.com/netbirdio/netbird/client/internal/ingressgw"
+	"github.com/netbirdio/netbird/client/internal/link"
 	"github.com/netbirdio/netbird/client/internal/metrics"
 	"github.com/netbirdio/netbird/client/internal/netflow"
 	nftypes "github.com/netbirdio/netbird/client/internal/netflow/types"
@@ -66,8 +68,6 @@ import (
 	signal "github.com/netbirdio/netbird/shared/signal/client"
 	sProto "github.com/netbirdio/netbird/shared/signal/proto"
 	"github.com/netbirdio/netbird/util"
-
-	"github.com/netbirdio/netbird/client/internal/link"
 )
 
 // PeerConnectionTimeoutMax is a timeout of an initial connection attempt to a remote peer.
@@ -137,9 +137,12 @@ type EngineConfig struct {
 
 	MTU uint16
 
-	// CipherType selects the encryption algorithm for management/signal communication.
-	// Valid values: "nacl" (default, backward compatible) or "aesgcm" (FIPS-compliant).
-	CipherType string
+	// BabelEnabled turns on the babeld routing sidecar for mesh links.
+	BabelEnabled bool
+
+	// MeshLinks are locally-configured secondary transport links (interface +
+	// static peers). Empty means single-link behavior.
+	MeshLinks []profilemanager.MeshLinkConfig
 
 	// for debug bundle generation
 	ProfileConfig *profilemanager.Config
@@ -197,6 +200,18 @@ type Engine struct {
 	// linkManager manages multiple transport links for multi-link mesh.
 	// In single-link mode, it wraps the primary wgInterface.
 	linkManager *link.Manager
+
+	// babelManager runs the optional babeld routing sidecar for mesh links.
+	// nil unless BabelEnabled and the sidecar started.
+	babelManager *babel.Manager
+
+	// linkMonitor periodically refreshes per-link health in the linkManager.
+	linkMonitor *link.Monitor
+
+	// meshIfaces are the secondary WireGuard interfaces created for mesh links,
+	// keyed by interface name (for O(1) liveness lookup). The LinkManager owns
+	// closing them; this map is for reference and health checks.
+	meshIfaces map[string]*iface.WGIface
 
 	udpMux *udpmux.UniversalUDPMuxDefault
 
@@ -341,6 +356,16 @@ func (e *Engine) Stop() error {
 
 	if err := e.removeAllPeers(); err != nil {
 		log.Errorf("failed to remove all peers: %s", err)
+	}
+
+	// Stop babeld before the route manager tears NetBird routing down, so babeld
+	// retracts its routes from its own table first and the two installers don't
+	// race over the kernel FIB.
+	if e.babelManager != nil {
+		if err := e.babelManager.Stop(); err != nil {
+			log.Warnf("failed to stop babel routing: %v", err)
+		}
+		e.babelManager = nil
 	}
 
 	if e.routeManager != nil {
@@ -536,6 +561,13 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	if e.rpManager != nil {
 		e.rpManager.SetInterface(e.wgInterface)
 	}
+
+	// Bring up locally-configured mesh links and the babeld sidecar. Both are
+	// best-effort: a failure here logs and continues rather than aborting the
+	// engine, so a node stays usable even if mesh routing can't start.
+	e.startMeshLinks()
+	e.startBabel()
+	e.startLinkMonitor()
 
 	// if inbound conns are blocked there is no need to create the ACL manager
 	if e.firewall != nil && !e.config.BlockInbound {
@@ -1512,10 +1544,23 @@ func (e *Engine) addNewPeer(peerConfig *mgmProto.RemotePeerConfig) error {
 func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentVersion string) (*peer.Conn, error) {
 	log.Debugf("creating peer connection %s", pubKey)
 
+	// Choose the interface to program this peer on via the LinkManager. In
+	// single-link mode SelectLink returns the primary link (its interface is
+	// e.wgInterface), so this is behavior-preserving; it becomes load-bearing
+	// once a peer has multi-link reachability.
+	wgIface := peer.WGIface(e.wgInterface)
+	if e.linkManager != nil {
+		if l := e.linkManager.SelectLink(pubKey); l != nil {
+			if wi, ok := l.Iface.(peer.WGIface); ok {
+				wgIface = wi
+			}
+		}
+	}
+
 	wgConfig := peer.WgConfig{
 		RemoteKey:    pubKey,
 		WgListenPort: e.config.WgPort,
-		WgInterface:  e.wgInterface,
+		WgInterface:  wgIface,
 		AllowedIps:   allowedIPs,
 		PreSharedKey: e.config.PreSharedKey,
 	}
@@ -2382,35 +2427,233 @@ func (e *Engine) LinkManager() *link.Manager {
 	return e.linkManager
 }
 
-// updateLinkConfigs collects link configurations from all remote peers and
-// updates the LinkManager. This allows the engine to be aware of available
-// transport links for each peer.
+// meshPersistentKeepalive keeps static mesh tunnels warm through NAT/stateful
+// filters. Radio links usually don't need it, but it is cheap insurance.
+const meshPersistentKeepalive = 25 * time.Second
+
+// startMeshLinks brings up locally-configured secondary WireGuard interfaces and
+// programs their static peers directly (no ICE, no signal). Each mesh link is
+// registered with the LinkManager as an owned interface, and its peers get a
+// reachability entry so SelectLink routes them over the mesh link. Everything is
+// best-effort per link: a failure logs and continues, leaving the rest of the
+// engine (and other links) working.
+func (e *Engine) startMeshLinks() {
+	if len(e.config.MeshLinks) == 0 {
+		return
+	}
+	switch runtime.GOOS {
+	case "android", "ios":
+		log.Warnf("mesh links are not supported on %s; skipping %d configured link(s)", runtime.GOOS, len(e.config.MeshLinks))
+		return
+	}
+
+	if e.meshIfaces == nil {
+		e.meshIfaces = make(map[string]*iface.WGIface)
+	}
+
+	for _, ml := range e.config.MeshLinks {
+		if err := e.startMeshLink(ml); err != nil {
+			log.Errorf("mesh link %q: %v", ml.ID, err)
+		}
+	}
+}
+
+// startMeshLink creates one mesh interface and programs its static peers.
+func (e *Engine) startMeshLink(ml profilemanager.MeshLinkConfig) error {
+	if ml.ID == "" || ml.InterfaceName == "" {
+		return fmt.Errorf("id and interfaceName are required")
+	}
+	if ml.ID == "default" {
+		return fmt.Errorf("id %q is reserved", ml.ID)
+	}
+
+	mtu := ml.MTU
+	if mtu == 0 {
+		mtu = e.config.MTU
+	}
+
+	transportNet, err := e.newStdNet()
+	if err != nil {
+		log.Warnf("mesh link %q: stdnet: %v", ml.ID, err)
+	}
+
+	opts := iface.WGIFaceOpts{
+		IFaceName:    ml.InterfaceName,
+		Address:      ml.Address,
+		WGPort:       ml.ListenPort,
+		WGPrivKey:    e.config.WgPrivateKey.String(),
+		MTU:          mtu,
+		TransportNet: transportNet,
+		DisableDNS:   true, // mesh links do not run DNS
+	}
+
+	wg, err := iface.NewWGIFace(opts)
+	if err != nil {
+		return fmt.Errorf("new interface: %w", err)
+	}
+	if err := wg.Create(); err != nil {
+		return fmt.Errorf("create interface %s: %w", ml.InterfaceName, err)
+	}
+	// Bring the device up. Mesh links are static (no ICE), so the returned UDP
+	// mux is not needed.
+	if _, err := wg.Up(); err != nil {
+		_ = wg.Close()
+		return fmt.Errorf("bring up interface %s: %w", ml.InterfaceName, err)
+	}
+
+	priority := ml.Priority
+	if priority == 0 {
+		priority = 10 // default mesh links below the primary (0) unless set
+	}
+	e.linkManager.RegisterInterfaceLink(link.NewInterfaceLink(ml.ID, "wireguard", priority, wg, true))
+	e.meshIfaces[ml.InterfaceName] = wg
+
+	// Program static peers and record their reachability over this link.
+	for _, p := range ml.Peers {
+		if err := e.programMeshPeer(ml.ID, wg, p); err != nil {
+			log.Warnf("mesh link %q peer %q: %v", ml.ID, p.PublicKey, err)
+		}
+	}
+
+	log.Infof("mesh link %q up on %s (priority=%d, peers=%d)", ml.ID, ml.InterfaceName, priority, len(ml.Peers))
+	return nil
+}
+
+// programMeshPeer configures a single static peer on a mesh interface and
+// records its reachability with the LinkManager.
+func (e *Engine) programMeshPeer(linkID string, wg *iface.WGIface, p profilemanager.MeshPeerConfig) error {
+	allowed, err := parsePrefixes(p.AllowedIPs)
+	if err != nil {
+		return fmt.Errorf("allowed IPs: %w", err)
+	}
+	endpoint, err := net.ResolveUDPAddr("udp", p.Endpoint)
+	if err != nil {
+		return fmt.Errorf("endpoint %q: %w", p.Endpoint, err)
+	}
+	if err := wg.UpdatePeer(p.PublicKey, allowed, meshPersistentKeepalive, endpoint, e.config.PreSharedKey); err != nil {
+		return fmt.Errorf("update peer: %w", err)
+	}
+	e.linkManager.SetPeerLinks(p.PublicKey, []link.PeerLink{{LinkID: linkID, Endpoint: p.Endpoint, AllowedIPs: p.AllowedIPs}})
+	return nil
+}
+
+// parsePrefixes parses CIDR strings into netip prefixes.
+func parsePrefixes(cidrs []string) ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0, len(cidrs))
+	for _, c := range cidrs {
+		pfx, err := netip.ParsePrefix(c)
+		if err != nil {
+			return nil, fmt.Errorf("parse %q: %w", c, err)
+		}
+		out = append(out, pfx)
+	}
+	return out, nil
+}
+
+// startBabel starts the babeld routing sidecar when enabled. It runs on the mesh
+// interfaces if any were created, otherwise on the primary interface so mesh
+// peers reachable over it still benefit from dynamic routing. Best-effort: a
+// failure (including babeld not being installed) logs and leaves routing static.
+func (e *Engine) startBabel() {
+	if !e.config.BabelEnabled {
+		return
+	}
+
+	var ifaces []string
+	for _, wg := range e.meshIfaces {
+		ifaces = append(ifaces, wg.Name())
+	}
+	if len(ifaces) == 0 && e.wgInterface != nil {
+		ifaces = append(ifaces, e.wgInterface.Name())
+	}
+	if len(ifaces) == 0 {
+		log.Warn("babel enabled but no interfaces to run on; skipping")
+		return
+	}
+
+	cfg := babel.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Interfaces = ifaces
+
+	e.babelManager = babel.NewManager(cfg)
+	if err := e.babelManager.Start(e.ctx); err != nil {
+		log.Warnf("failed to start babel routing: %v", err)
+		e.babelManager = nil
+		return
+	}
+	if e.babelManager.IsRunning() {
+		log.Infof("babel routing started on interfaces %v", ifaces)
+	}
+}
+
+// startLinkMonitor launches the per-link health monitor. It feeds babel
+// neighbour RTT/cost (when babeld is running) and mesh-interface liveness into
+// the LinkManager so path selection reacts to real link health. The monitor is
+// ctx-cancellable and tracked by shutdownWg, so Stop's cancel + wait drains it.
+func (e *Engine) startLinkMonitor() {
+	if e.linkManager == nil {
+		return
+	}
+
+	neighFn := func() ([]link.Neighbour, error) {
+		if e.babelManager == nil || !e.babelManager.IsRunning() {
+			return nil, nil
+		}
+		nbs, err := e.babelManager.GetNeighbours()
+		if err != nil {
+			return nil, err
+		}
+		out := make([]link.Neighbour, 0, len(nbs))
+		for _, n := range nbs {
+			rtt := uint32(0)
+			if n.RTT > 0 {
+				rtt = uint32(n.RTT)
+			}
+			out = append(out, link.Neighbour{Interface: n.Interface, RTTMs: rtt, Cost: n.Cost, Up: true})
+		}
+		return out, nil
+	}
+
+	livenessFn := func(ifName string) (bool, uint32) {
+		// A mesh interface that exists is treated as up; without babel there is no
+		// RTT to report. This keeps static (babel-disabled) mesh links selectable.
+		_, ok := e.meshIfaces[ifName]
+		return ok, 0
+	}
+
+	e.linkMonitor = link.NewMonitor(e.linkManager, link.DefaultMonitorInterval, neighFn, livenessFn)
+	e.shutdownWg.Add(1)
+	go func() {
+		defer e.shutdownWg.Done()
+		e.linkMonitor.Run(e.ctx)
+	}()
+}
+
+// updateLinkConfigs records, per peer, which transport links the management
+// server says that peer is reachable over. It keys reachability by peer (not by
+// a global link id), so two peers advertising the same link id no longer
+// collide. This is forward-compat plumbing: the server does not yet populate
+// RemotePeerConfig.Links, so in practice this clears reachability and every peer
+// falls back to the primary link.
 func (e *Engine) updateLinkConfigs(remotePeers []*mgmProto.RemotePeerConfig) {
 	if e.linkManager == nil {
 		return
 	}
 
-	var allLinks []link.LinkConfigMsg
 	for _, p := range remotePeers {
-		for _, lc := range p.GetLinks() {
-			allLinks = append(allLinks, link.LinkConfigMsg{
-				LinkID:           lc.GetLinkId(),
-				TransportType:    lc.GetTransportType(),
-				Endpoint:         lc.GetEndpoint(),
-				MTU:              lc.GetMtu(),
-				Priority:         lc.GetPriority(),
-				Cost:             lc.GetCost(),
-				WgIfaceName:      lc.GetWgIfaceName(),
-				MulticastEnabled: lc.GetMulticastEnabled(),
+		protoLinks := p.GetLinks()
+		if len(protoLinks) == 0 {
+			e.linkManager.SetPeerLinks(p.GetWgPubKey(), nil)
+			continue
+		}
+		peerLinks := make([]link.PeerLink, 0, len(protoLinks))
+		for _, lc := range protoLinks {
+			peerLinks = append(peerLinks, link.PeerLink{
+				LinkID:   lc.GetLinkId(),
+				Endpoint: lc.GetEndpoint(),
 			})
 		}
-		if len(p.GetLinks()) > 0 {
-			log.Debugf("peer %s has %d link configs", p.GetWgPubKey(), len(p.GetLinks()))
-		}
-	}
-
-	if len(allLinks) > 0 {
-		e.linkManager.UpdateFromConfig(allLinks)
-		log.Infof("updated link manager with %d link configs from %d peers", len(allLinks), len(remotePeers))
+		e.linkManager.SetPeerLinks(p.GetWgPubKey(), peerLinks)
+		log.Debugf("peer %s reachable over %d link(s)", p.GetWgPubKey(), len(peerLinks))
 	}
 }

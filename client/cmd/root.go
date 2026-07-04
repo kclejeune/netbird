@@ -31,6 +31,8 @@ const (
 	dnsResolverAddress       = "dns-resolver-address"
 	enableRosenpassFlag      = "enable-rosenpass"
 	rosenpassPermissiveFlag  = "rosenpass-permissive"
+	cipherTypeFlag           = "cipher-type"
+	enableBabelFlag          = "enable-babel"
 	preSharedKeyFlag         = "preshared-key"
 	interfaceNameFlag        = "interface-name"
 	wireguardPortFlag        = "wireguard-port"
@@ -64,6 +66,8 @@ var (
 	customDNSAddress        string
 	rosenpassEnabled        bool
 	rosenpassPermissive     bool
+	cipherType              string
+	babelEnabled            bool
 	interfaceName           string
 	wireguardPort           uint16
 	networkMonitor          bool
@@ -188,6 +192,8 @@ func init() {
 	)
 	upCmd.PersistentFlags().BoolVar(&rosenpassEnabled, enableRosenpassFlag, false, "[Experimental] Enable Rosenpass feature. If enabled, the connection will be post-quantum secured via Rosenpass.")
 	upCmd.PersistentFlags().BoolVar(&rosenpassPermissive, rosenpassPermissiveFlag, false, "[Experimental] Enable Rosenpass in permissive mode to allow this peer to accept WireGuard connections without requiring Rosenpass functionality from peers that do not have Rosenpass enabled.")
+	upCmd.PersistentFlags().StringVar(&cipherType, cipherTypeFlag, "", "[Experimental] Management/signal encryption cipher: \"\" or \"nacl\" (default, upstream-compatible) or \"aesgcm\" (X25519+AES-256-GCM; see docs for FIPS caveats). Must match the management server and all peers.")
+	upCmd.PersistentFlags().BoolVar(&babelEnabled, enableBabelFlag, false, "[Experimental] Enable the babeld routing sidecar for mesh links (Linux only; requires babeld installed).")
 	upCmd.PersistentFlags().BoolVar(&autoConnectDisabled, disableAutoConnectFlag, false, "Disables auto-connect feature. If enabled, then the client won't connect automatically when the service starts.")
 	upCmd.PersistentFlags().BoolVar(&lazyConnEnabled, enableLazyConnectionFlag, false, "[Experimental] Enable the lazy connection feature. If enabled, the client will establish connections on-demand. Note: this setting may be overridden by management configuration.")
 

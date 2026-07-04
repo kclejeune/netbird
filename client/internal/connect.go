@@ -33,9 +33,9 @@ import (
 	nbnet "github.com/netbirdio/netbird/client/net"
 	cProto "github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/client/ssh"
-	nbEncryption "github.com/netbirdio/netbird/encryption"
 	sshconfig "github.com/netbirdio/netbird/client/ssh/config"
 	"github.com/netbirdio/netbird/client/system"
+	nbEncryption "github.com/netbirdio/netbird/encryption"
 	mgm "github.com/netbirdio/netbird/shared/management/client"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
 	"github.com/netbirdio/netbird/shared/relay/auth/hmac"
@@ -561,9 +561,11 @@ func createEngineConfig(key wgtypes.Key, config *profilemanager.Config, peerConf
 
 		LazyConnectionEnabled: config.LazyConnectionEnabled,
 
-		MTU:        selectMTU(config.MTU, peerConfig.Mtu),
-		CipherType: config.CipherType,
-		LogPath:    logPath,
+		MTU:     selectMTU(config.MTU, peerConfig.Mtu),
+		LogPath: logPath,
+
+		BabelEnabled: config.BabelEnabled,
+		MeshLinks:    config.MeshLinks,
 
 		ProfileConfig: config,
 	}
