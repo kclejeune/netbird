@@ -1,0 +1,408 @@
+From 31d93415dd4a7009049c602006c450214619d70c Mon Sep 17 00:00:00 2001
+From: Claude <kc.lejeune@gmail.com>
+Date: Sat, 4 Jul 2026 06:31:16 +0000
+Subject: [PATCH] Add peer Mesh Links tab for MANET multi-link management
+
+Adds a "Mesh Links" tab to the peer detail page for viewing and editing
+the transport links a peer is reachable over (backed by the new
+GET/PUT /api/peers/{peerId}/mesh-links endpoint). Multiple links enable
+MANET-style multi-path routing with automatic failover.
+
+- MeshLink interface (linkId, transportType, endpoint, mtu, priority,
+  cost, wgIfaceName, multicastEnabled).
+- PeerMeshLinksSection: fetches the peer's links via useFetchApi, renders
+  them in a table, and provides an editor modal to add/edit/remove links
+  (with a multicast toggle) that PUTs the set and revalidates.
+- Wires the tab into the peer page (gated on peers.read), using the
+  existing Tabs, Modal, Button, Input, FancyToggleSwitch and notify
+  patterns.
+
+Typechecks clean (tsc --noEmit reports no errors in these files).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Wtik9j5uKmCDtt1d76EFta
+---
+ src/app/(dashboard)/peer/page.tsx         |  15 ++
+ src/interfaces/MeshLink.ts                |  10 +
+ src/modules/peer/PeerMeshLinksSection.tsx | 305 ++++++++++++++++++++++
+ 3 files changed, 330 insertions(+)
+ create mode 100644 src/interfaces/MeshLink.ts
+ create mode 100644 src/modules/peer/PeerMeshLinksSection.tsx
+
+diff --git a/src/app/(dashboard)/peer/page.tsx b/src/app/(dashboard)/peer/page.tsx
+index c9e10e1..b0cb7fe 100644
+--- a/src/app/(dashboard)/peer/page.tsx
++++ b/src/app/(dashboard)/peer/page.tsx
+@@ -42,6 +42,7 @@ import {
+   NetworkIcon,
+   PencilIcon,
+   RadioTowerIcon,
++  WifiIcon,
+ } from "lucide-react";
+ import Link from "next/link";
+ import { useRouter, useSearchParams } from "next/navigation";
+@@ -69,6 +70,7 @@ import type { User } from "@/interfaces/User";
+ import PageContainer from "@/layouts/PageContainer";
+ import useGroupHelper from "@/modules/groups/useGroupHelper";
+ import { AccessiblePeersSection } from "@/modules/peer/AccessiblePeersSection";
++import { PeerMeshLinksSection } from "@/modules/peer/PeerMeshLinksSection";
+ import { PeerNetworkRoutesSection } from "@/modules/peer/PeerNetworkRoutesSection";
+ import { PeerRemoteJobsSection } from "@/modules/peer/PeerRemoteJobsSection";
+ import ReverseProxiesProvider, {
+@@ -372,6 +374,13 @@ const PeerOverviewTabs = () => {
+           </TabsTrigger>
+         )}
+ 
++        {peer?.id && permission.peers.read && (
++          <TabsTrigger value={"mesh-links"}>
++            <WifiIcon size={16} />
++            Mesh Links
++          </TabsTrigger>
++        )}
++
+         {peer?.id && permission.services?.read && (
+           <TabsTrigger value={"reverse-proxies"}>
+             <ReverseProxyIcon
+@@ -408,6 +417,12 @@ const PeerOverviewTabs = () => {
+         </TabsContent>
+       )}
+ 
++      {peer?.id && permission.peers.read && (
++        <TabsContent value={"mesh-links"} className={"pb-8"}>
++          <PeerMeshLinksSection peer={peer} />
++        </TabsContent>
++      )}
++
+       {peer?.id && permission.services?.read && (
+         <TabsContent value={"reverse-proxies"} className={"pb-8"}>
+           <ReverseProxyFlatTargetsTabContent
+diff --git a/src/interfaces/MeshLink.ts b/src/interfaces/MeshLink.ts
+new file mode 100644
+index 0000000..6ecc688
+--- /dev/null
++++ b/src/interfaces/MeshLink.ts
+@@ -0,0 +1,10 @@
++export interface MeshLink {
++  linkId: string;
++  transportType?: string;
++  endpoint?: string;
++  mtu?: number;
++  priority?: number;
++  cost?: number;
++  wgIfaceName?: string;
++  multicastEnabled?: boolean;
++}
+diff --git a/src/modules/peer/PeerMeshLinksSection.tsx b/src/modules/peer/PeerMeshLinksSection.tsx
+new file mode 100644
+index 0000000..a238628
+--- /dev/null
++++ b/src/modules/peer/PeerMeshLinksSection.tsx
+@@ -0,0 +1,305 @@
++"use client";
++
++import Button from "@components/Button";
++import { Input } from "@components/Input";
++import { Label } from "@components/Label";
++import {
++  Modal,
++  ModalContent,
++  ModalFooter,
++} from "@components/modal/Modal";
++import ModalHeader from "@components/modal/ModalHeader";
++import { notify } from "@components/Notification";
++import Paragraph from "@components/Paragraph";
++import SkeletonTable from "@components/skeletons/SkeletonTable";
++import FancyToggleSwitch from "@components/FancyToggleSwitch";
++import useFetchApi, { useApiCall } from "@utils/api";
++import { PlusIcon, RadioTowerIcon, Trash2Icon } from "lucide-react";
++import { useMemo, useState } from "react";
++import type { MeshLink } from "@/interfaces/MeshLink";
++import type { Peer } from "@/interfaces/Peer";
++
++type Props = {
++  peer: Peer;
++};
++
++/**
++ * PeerMeshLinksSection lists and edits the transport (mesh) links a peer is
++ * reachable over. Links are distributed to other peers in the network map and
++ * drive multi-link / MANET path selection on the client.
++ */
++export const PeerMeshLinksSection = ({ peer }: Props) => {
++  const url = "/peers/" + peer.id + "/mesh-links";
++  const { data: links, isLoading, mutate } = useFetchApi<MeshLink[]>(url);
++  const [editOpen, setEditOpen] = useState(false);
++
++  return (
++    <div className={"pb-10 px-8"}>
++      <div className={"flex justify-between items-center mb-5"}>
++        <Paragraph>
++          Transport links this peer is reachable over. Multiple links enable
++          MANET-style multi-path routing with automatic failover; the client
++          picks the best link by priority and observed health.
++        </Paragraph>
++        <Button
++          variant={"primary"}
++          size={"xs"}
++          onClick={() => setEditOpen(true)}
++          data-testid={"edit-mesh-links-button"}
++        >
++          <RadioTowerIcon size={14} />
++          Edit Mesh Links
++        </Button>
++      </div>
++
++      {isLoading ? (
++        <SkeletonTable withHeader={false} />
++      ) : (
++        <MeshLinksTable links={links ?? []} />
++      )}
++
++      {editOpen && (
++        <MeshLinksEditModal
++          open={editOpen}
++          onOpenChange={setEditOpen}
++          initial={links ?? []}
++          url={url}
++          onSaved={() => mutate()}
++        />
++      )}
++    </div>
++  );
++};
++
++function MeshLinksTable({ links }: { links: MeshLink[] }) {
++  if (links.length === 0) {
++    return (
++      <div
++        className={
++          "border border-nb-gray-900 rounded-md py-8 text-center text-nb-gray-400"
++        }
++      >
++        No mesh links assigned. This peer uses the default link only.
++      </div>
++    );
++  }
++  return (
++    <div className={"overflow-x-auto border border-nb-gray-900 rounded-md"}>
++      <table className={"w-full text-sm text-left"}>
++        <thead className={"text-nb-gray-400 bg-nb-gray-940"}>
++          <tr>
++            <th className={"px-4 py-2"}>Link ID</th>
++            <th className={"px-4 py-2"}>Transport</th>
++            <th className={"px-4 py-2"}>Endpoint</th>
++            <th className={"px-4 py-2"}>Interface</th>
++            <th className={"px-4 py-2 text-right"}>Priority</th>
++            <th className={"px-4 py-2 text-right"}>Cost</th>
++            <th className={"px-4 py-2 text-center"}>Multicast</th>
++          </tr>
++        </thead>
++        <tbody>
++          {links.map((l, i) => (
++            <tr key={l.linkId + i} className={"border-t border-nb-gray-900"}>
++              <td className={"px-4 py-2 font-mono text-nb-gray-200"}>
++                {l.linkId}
++              </td>
++              <td className={"px-4 py-2"}>{l.transportType || "wireguard"}</td>
++              <td className={"px-4 py-2 font-mono"}>{l.endpoint || "—"}</td>
++              <td className={"px-4 py-2 font-mono"}>{l.wgIfaceName || "—"}</td>
++              <td className={"px-4 py-2 text-right"}>{l.priority ?? 0}</td>
++              <td className={"px-4 py-2 text-right"}>{l.cost ?? 0}</td>
++              <td className={"px-4 py-2 text-center"}>
++                {l.multicastEnabled ? "Yes" : "No"}
++              </td>
++            </tr>
++          ))}
++        </tbody>
++      </table>
++    </div>
++  );
++}
++
++function emptyLink(): MeshLink {
++  return {
++    linkId: "",
++    transportType: "wireguard",
++    endpoint: "",
++    priority: 0,
++    cost: 0,
++    wgIfaceName: "",
++    multicastEnabled: false,
++  };
++}
++
++function MeshLinksEditModal({
++  open,
++  onOpenChange,
++  initial,
++  url,
++  onSaved,
++}: {
++  open: boolean;
++  onOpenChange: (v: boolean) => void;
++  initial: MeshLink[];
++  url: string;
++  onSaved: () => void;
++}) {
++  const [rows, setRows] = useState<MeshLink[]>(
++    initial.length ? initial.map((l) => ({ ...l })) : [],
++  );
++  const { put } = useApiCall<MeshLink[]>(url);
++
++  const valid = useMemo(
++    () => rows.every((r) => r.linkId.trim().length > 0),
++    [rows],
++  );
++
++  const update = (i: number, patch: Partial<MeshLink>) =>
++    setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
++  const remove = (i: number) =>
++    setRows((prev) => prev.filter((_, idx) => idx !== i));
++  const add = () => setRows((prev) => [...prev, emptyLink()]);
++
++  const save = () => {
++    const payload = rows.map((r) => ({
++      linkId: r.linkId.trim(),
++      transportType: r.transportType?.trim() || "wireguard",
++      endpoint: r.endpoint?.trim() || undefined,
++      wgIfaceName: r.wgIfaceName?.trim() || undefined,
++      priority: Number(r.priority) || 0,
++      cost: Number(r.cost) || 0,
++      multicastEnabled: !!r.multicastEnabled,
++    }));
++    notify({
++      title: "Mesh Links",
++      description: "Mesh links updated successfully.",
++      loadingMessage: "Saving mesh links...",
++      promise: put(payload).then(() => {
++        onSaved();
++        onOpenChange(false);
++      }),
++    });
++  };
++
++  return (
++    <Modal open={open} onOpenChange={onOpenChange}>
++      <ModalContent maxWidthClass={"max-w-3xl"}>
++        <ModalHeader
++          icon={<RadioTowerIcon size={18} />}
++          title={"Edit Mesh Links"}
++          description={
++            "Assign the transport links this peer is reachable over. Link IDs must match the interface link ids configured on the mesh clients."
++          }
++        />
++
++        <div className={"px-8 py-4 flex flex-col gap-4 max-h-[55vh] overflow-y-auto"}>
++          {rows.length === 0 && (
++            <Paragraph className={"text-nb-gray-400"}>
++              No links yet. Add one below.
++            </Paragraph>
++          )}
++
++          {rows.map((row, i) => (
++            <div
++              key={i}
++              className={
++                "border border-nb-gray-900 rounded-md p-4 flex flex-col gap-3"
++              }
++            >
++              <div className={"flex justify-between items-center"}>
++                <span className={"text-nb-gray-300 text-sm font-medium"}>
++                  Link {i + 1}
++                </span>
++                <Button
++                  variant={"danger-outline"}
++                  size={"xs"}
++                  onClick={() => remove(i)}
++                >
++                  <Trash2Icon size={14} />
++                  Remove
++                </Button>
++              </div>
++
++              <div className={"grid grid-cols-2 gap-3"}>
++                <div className={"flex flex-col gap-1"}>
++                  <Label>Link ID</Label>
++                  <Input
++                    placeholder={"mesh0"}
++                    value={row.linkId}
++                    onChange={(e) => update(i, { linkId: e.target.value })}
++                  />
++                </div>
++                <div className={"flex flex-col gap-1"}>
++                  <Label>Transport Type</Label>
++                  <Input
++                    placeholder={"wireguard"}
++                    value={row.transportType ?? ""}
++                    onChange={(e) =>
++                      update(i, { transportType: e.target.value })
++                    }
++                  />
++                </div>
++                <div className={"flex flex-col gap-1"}>
++                  <Label>Endpoint</Label>
++                  <Input
++                    placeholder={"10.0.0.2:51820 (optional)"}
++                    value={row.endpoint ?? ""}
++                    onChange={(e) => update(i, { endpoint: e.target.value })}
++                  />
++                </div>
++                <div className={"flex flex-col gap-1"}>
++                  <Label>WireGuard Interface</Label>
++                  <Input
++                    placeholder={"wt-mesh0 (optional)"}
++                    value={row.wgIfaceName ?? ""}
++                    onChange={(e) => update(i, { wgIfaceName: e.target.value })}
++                  />
++                </div>
++                <div className={"flex flex-col gap-1"}>
++                  <Label>Priority (lower = preferred)</Label>
++                  <Input
++                    type={"number"}
++                    value={String(row.priority ?? 0)}
++                    onChange={(e) =>
++                      update(i, { priority: Number(e.target.value) })
++                    }
++                  />
++                </div>
++                <div className={"flex flex-col gap-1"}>
++                  <Label>Cost</Label>
++                  <Input
++                    type={"number"}
++                    value={String(row.cost ?? 0)}
++                    onChange={(e) => update(i, { cost: Number(e.target.value) })}
++                  />
++                </div>
++              </div>
++
++              <FancyToggleSwitch
++                value={!!row.multicastEnabled}
++                onChange={(v) => update(i, { multicastEnabled: v })}
++                label={"Multicast discovery enabled"}
++              />
++            </div>
++          ))}
++
++          <div>
++            <Button variant={"dotted"} size={"sm"} onClick={add}>
++              <PlusIcon size={14} />
++              Add Link
++            </Button>
++          </div>
++        </div>
++
++        <ModalFooter className={"items-center"}>
++          <Button variant={"secondary"} onClick={() => onOpenChange(false)}>
++            Cancel
++          </Button>
++          <Button variant={"primary"} disabled={!valid} onClick={save}>
++            Save Mesh Links
++          </Button>
++        </ModalFooter>
++      </ModalContent>
++    </Modal>
++  );
++}
+-- 
+2.43.0
+
