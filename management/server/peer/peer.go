@@ -60,11 +60,9 @@ type Peer struct {
 	AllowExtraDNSLabels bool
 
 	// MeshLinks are the transport links this peer is reachable over, distributed
-	// to other peers in the network map as RemotePeerConfig.Links. It is
-	// intentionally not persisted (gorm:"-"): populating it from an admin
-	// API / account topology is future work; for now it is an in-memory source
-	// that the network-map builder emits when present.
-	MeshLinks []MeshLink `gorm:"-" json:"-"`
+	// to other peers in the network map as RemotePeerConfig.Links. Persisted as a
+	// JSON column and edited via the peer mesh-links admin API.
+	MeshLinks []MeshLink `gorm:"serializer:json"`
 }
 
 // MeshLink is a server-side description of one transport link a peer is

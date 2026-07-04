@@ -342,6 +342,38 @@ func (am *DefaultAccountManager) UpdatePeer(ctx context.Context, accountID, user
 	return peer, nil
 }
 
+// SetPeerMeshLinks replaces the transport links a peer is reachable over. The
+// links are distributed to other peers in the network map (RemotePeerConfig.Links)
+// and propagated immediately via UpdateAccountPeers.
+func (am *DefaultAccountManager) SetPeerMeshLinks(ctx context.Context, accountID, peerID, userID string, links []nbpeer.MeshLink) (*nbpeer.Peer, error) {
+	allowed, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Peers, operations.Update)
+	if err != nil {
+		return nil, status.NewPermissionValidationError(err)
+	}
+	if !allowed {
+		return nil, status.NewPermissionDeniedError()
+	}
+
+	var peer *nbpeer.Peer
+	err = am.Store.ExecuteInTransaction(ctx, func(transaction store.Store) error {
+		peer, err = transaction.GetPeerByID(ctx, store.LockingStrengthUpdate, accountID, peerID)
+		if err != nil {
+			return err
+		}
+		peer.MeshLinks = links
+		if err = transaction.IncrementNetworkSerial(ctx, accountID); err != nil {
+			return err
+		}
+		return transaction.SavePeer(ctx, accountID, peer)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	am.UpdateAccountPeers(ctx, accountID)
+	return peer, nil
+}
+
 func (am *DefaultAccountManager) CreatePeerJob(ctx context.Context, accountID, peerID, userID string, job *types.Job) error {
 	allowed, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.RemoteJobs, operations.Create)
 	if err != nil {

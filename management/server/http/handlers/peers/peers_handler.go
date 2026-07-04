@@ -43,6 +43,8 @@ func AddEndpoints(accountManager account.Manager, router *mux.Router, networkMap
 	router.HandleFunc("/peers/{peerId}/jobs", peersHandler.ListJobs).Methods("GET", "OPTIONS")
 	router.HandleFunc("/peers/{peerId}/jobs", peersHandler.CreateJob).Methods("POST", "OPTIONS")
 	router.HandleFunc("/peers/{peerId}/jobs/{jobId}", peersHandler.GetJob).Methods("GET", "OPTIONS")
+	router.HandleFunc("/peers/{peerId}/mesh-links", peersHandler.GetPeerMeshLinks).Methods("GET", "OPTIONS")
+	router.HandleFunc("/peers/{peerId}/mesh-links", peersHandler.SetPeerMeshLinks).Methods("PUT", "OPTIONS")
 }
 
 // NewHandler creates a new peers Handler
