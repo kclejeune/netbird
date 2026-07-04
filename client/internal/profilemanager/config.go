@@ -193,6 +193,16 @@ type Config struct {
 	// RosterGraceSeconds extends roster validity past its expiry (clock-drift /
 	// disconnected slack). 0 uses a safe default.
 	RosterGraceSeconds int
+
+	// RosterMulticastGroup enables multicast beacon discovery when set (e.g.
+	// "239.9.9.9:5353"). Rostered peers without a static endpoint are discovered
+	// and programmed as their signed beacons arrive.
+	RosterMulticastGroup string
+
+	// RosterAdvertiseEndpoint is the transport endpoint this node announces in
+	// its beacons (host:port). Empty means receive-only (discover others without
+	// announcing ourselves).
+	RosterAdvertiseEndpoint string
 }
 
 // MeshLinkConfig describes a locally-configured secondary transport link: a

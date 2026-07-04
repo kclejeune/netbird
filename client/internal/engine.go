@@ -148,9 +148,11 @@ type EngineConfig struct {
 	MeshLinks []profilemanager.MeshLinkConfig
 
 	// Roster settings for disconnected ("offline island") operation.
-	RosterPath         string
-	RosterTrustAnchor  string
-	RosterGraceSeconds int
+	RosterPath              string
+	RosterTrustAnchor       string
+	RosterGraceSeconds      int
+	RosterMulticastGroup    string
+	RosterAdvertiseEndpoint string
 
 	// for debug bundle generation
 	ProfileConfig *profilemanager.Config
@@ -2651,9 +2653,28 @@ func (e *Engine) startRoster() {
 	}
 
 	e.applyRoster(active)
+	e.startRosterDiscovery(active)
+}
+
+// programRosterPeer programs one roster peer (static or discovered) onto the
+// primary interface with the given endpoint.
+func (e *Engine) programRosterPeer(wgPubKey string, allowedIPs []string, endpoint string) error {
+	if e.wgInterface == nil {
+		return fmt.Errorf("interface not up")
+	}
+	allowed, err := parsePrefixes(allowedIPs)
+	if err != nil {
+		return fmt.Errorf("allowed IPs: %w", err)
+	}
+	ep, err := net.ResolveUDPAddr("udp", endpoint)
+	if err != nil {
+		return fmt.Errorf("endpoint %q: %w", endpoint, err)
+	}
+	return e.wgInterface.UpdatePeer(wgPubKey, allowed, meshPersistentKeepalive, ep, e.config.PreSharedKey)
 }
 
 // applyRoster programs static-endpoint roster peers onto the primary interface.
+// Peers without a static endpoint are left for beacon discovery.
 func (e *Engine) applyRoster(r *roster.Roster) {
 	if e.wgInterface == nil {
 		return
@@ -2668,23 +2689,57 @@ func (e *Engine) applyRoster(r *roster.Roster) {
 			awaiting++ // reachable identity known; endpoint awaits discovery
 			continue
 		}
-		allowed, err := parsePrefixes(p.AllowedIPs)
-		if err != nil {
-			log.Warnf("roster peer %s allowedIPs: %v", p.WGPubKey, err)
-			continue
-		}
-		endpoint, err := net.ResolveUDPAddr("udp", p.Endpoint)
-		if err != nil {
-			log.Warnf("roster peer %s endpoint %q: %v", p.WGPubKey, p.Endpoint, err)
-			continue
-		}
-		if err := e.wgInterface.UpdatePeer(p.WGPubKey, allowed, meshPersistentKeepalive, endpoint, e.config.PreSharedKey); err != nil {
+		if err := e.programRosterPeer(p.WGPubKey, p.AllowedIPs, p.Endpoint); err != nil {
 			log.Warnf("roster peer %s program: %v", p.WGPubKey, err)
 			continue
 		}
 		programmed++
 	}
 	log.Infof("roster: applied %d static peer(s); %d awaiting endpoint discovery", programmed, awaiting)
+}
+
+// startRosterDiscovery launches multicast beacon discovery when a group is
+// configured, programming rostered peers as their signed beacons arrive. It is
+// best-effort: failing to join the group logs and leaves static peers working.
+func (e *Engine) startRosterDiscovery(active *roster.Roster) {
+	if e.config.RosterMulticastGroup == "" {
+		return
+	}
+	beaconPriv, _, err := roster.DeriveBeaconKey(e.config.WgPrivateKey)
+	if err != nil {
+		log.Errorf("roster discovery: derive beacon key: %v", err)
+		return
+	}
+	conn, group, err := roster.NewMulticastConn(e.config.RosterMulticastGroup, nil)
+	if err != nil {
+		log.Warnf("roster discovery disabled: %v", err)
+		return
+	}
+
+	localPub := e.config.WgPrivateKey.PublicKey().String()
+	disc := roster.NewDiscovery(roster.DiscoveryConfig{
+		Conn:         conn,
+		Group:        group,
+		SelfWGPubKey: localPub,
+		SelfEndpoint: e.config.RosterAdvertiseEndpoint,
+		BeaconPriv:   beaconPriv,
+		Roster:       active,
+		OnPeer: func(dp roster.DiscoveredPeer) {
+			if err := e.programRosterPeer(dp.Peer.WGPubKey, dp.Peer.AllowedIPs, dp.Endpoint); err != nil {
+				log.Warnf("roster discovery: program %s@%s: %v", dp.Peer.WGPubKey, dp.Endpoint, err)
+				return
+			}
+			log.Infof("roster discovery: programmed %s via %s", dp.Peer.WGPubKey, dp.Endpoint)
+		},
+	})
+
+	e.shutdownWg.Add(1)
+	go func() {
+		defer e.shutdownWg.Done()
+		defer func() { _ = conn.Close() }()
+		disc.Run(e.ctx)
+	}()
+	log.Infof("roster discovery listening on %s (advertise=%q)", e.config.RosterMulticastGroup, e.config.RosterAdvertiseEndpoint)
 }
 
 // startBabel starts the babeld routing sidecar when enabled. It runs on the mesh

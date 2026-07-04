@@ -567,9 +567,11 @@ func createEngineConfig(key wgtypes.Key, config *profilemanager.Config, peerConf
 		BabelEnabled: config.BabelEnabled,
 		MeshLinks:    config.MeshLinks,
 
-		RosterPath:         config.RosterPath,
-		RosterTrustAnchor:  config.RosterTrustAnchor,
-		RosterGraceSeconds: config.RosterGraceSeconds,
+		RosterPath:              config.RosterPath,
+		RosterTrustAnchor:       config.RosterTrustAnchor,
+		RosterGraceSeconds:      config.RosterGraceSeconds,
+		RosterMulticastGroup:    config.RosterMulticastGroup,
+		RosterAdvertiseEndpoint: config.RosterAdvertiseEndpoint,
 
 		ProfileConfig: config,
 	}
