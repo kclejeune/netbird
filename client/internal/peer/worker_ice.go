@@ -365,7 +365,7 @@ func (w *WorkerICE) onICECandidate(candidate ice.Candidate) {
 	// TODO: reported port is incorrect for CandidateTypeHost, makes understanding ICE use via logs confusing as port is ignored
 	w.log.Debugf("discovered local candidate %s", candidate.String())
 	go func() {
-		err := w.signaler.SignalICECandidate(candidate, w.config.Key)
+		err := w.signaler.SignalICECandidate(candidate, w.config.Key, w.config.LinkID)
 		if err != nil {
 			w.log.Errorf("failed signaling candidate to the remote peer %s %s", w.config.Key, err)
 		}

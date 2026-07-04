@@ -84,6 +84,12 @@ type ConnConfig struct {
 
 	// ICEConfig ICE protocol configuration
 	ICEConfig icemaker.Config
+
+	// LinkID identifies which transport link this peer connection is bound to
+	// (from LinkManager.SelectLink). Empty means the primary/default link. It is
+	// stamped onto outgoing signal messages and available on receipt so the peer
+	// can, in future, run per-link negotiation.
+	LinkID string
 }
 
 type Conn struct {

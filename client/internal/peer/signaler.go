@@ -29,13 +29,14 @@ func (s *Signaler) SignalAnswer(offer OfferAnswer, remoteKey string) error {
 	return s.signalOfferAnswer(offer, remoteKey, sProto.Body_ANSWER)
 }
 
-func (s *Signaler) SignalICECandidate(candidate ice.Candidate, remoteKey string) error {
+func (s *Signaler) SignalICECandidate(candidate ice.Candidate, remoteKey string, linkID string) error {
 	return s.signal.Send(&sProto.Message{
 		Key:       s.wgPrivateKey.PublicKey().String(),
 		RemoteKey: remoteKey,
 		Body: &sProto.Body{
 			Type:    sProto.Body_CANDIDATE,
 			Payload: candidate.Marshal(),
+			LinkId:  linkID,
 		},
 	})
 }
@@ -65,6 +66,12 @@ func (s *Signaler) signalOfferAnswer(offerAnswer OfferAnswer, remoteKey string, 
 		sessionIDBytes)
 	if err != nil {
 		return err
+	}
+
+	// Stamp the link id onto the offer/answer so the remote knows which of our
+	// transport links this negotiation belongs to. Empty for the default link.
+	if msg.Body != nil {
+		msg.Body.LinkId = offerAnswer.LinkID
 	}
 
 	if err = s.signal.Send(msg); err != nil {

@@ -41,6 +41,10 @@ type OfferAnswer struct {
 	RelaySrvAddress string
 	// SessionID is the unique identifier of the session, used to discard old messages
 	SessionID *ICESessionID
+
+	// LinkID identifies which transport link this offer/answer is for. Empty
+	// means the legacy single-link ("default") path.
+	LinkID string
 }
 
 type Handshaker struct {
@@ -192,6 +196,7 @@ func (h *Handshaker) buildOfferAnswer() OfferAnswer {
 		RosenpassPubKey: h.config.RosenpassConfig.PubKey,
 		RosenpassAddr:   h.config.RosenpassConfig.Addr,
 		SessionID:       &sid,
+		LinkID:          h.config.LinkID,
 	}
 
 	if addr, err := h.relay.RelayInstanceAddress(); err == nil {

@@ -1547,10 +1547,13 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 	// Choose the interface to program this peer on via the LinkManager. In
 	// single-link mode SelectLink returns the primary link (its interface is
 	// e.wgInterface), so this is behavior-preserving; it becomes load-bearing
-	// once a peer has multi-link reachability.
+	// once a peer has multi-link reachability. The chosen link id is stamped onto
+	// the connection so outgoing signal messages carry it.
 	wgIface := peer.WGIface(e.wgInterface)
+	linkID := ""
 	if e.linkManager != nil {
 		if l := e.linkManager.SelectLink(pubKey); l != nil {
+			linkID = l.ID
 			if wi, ok := l.Iface.(peer.WGIface); ok {
 				wgIface = wi
 			}
@@ -1580,6 +1583,7 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 			PermissiveMode: e.config.RosenpassPermissive,
 		},
 		ICEConfig: e.createICEConfig(),
+		LinkID:    linkID,
 	}
 
 	serviceDependencies := peer.ServiceDependencies{
@@ -1650,6 +1654,13 @@ func (e *Engine) receiveSignalEvents() {
 				if err != nil {
 					log.Errorf("failed on parsing remote candidate %s -> %s", candidate, err)
 					return err
+				}
+
+				// The remote stamps which of its links this candidate belongs to.
+				// Threaded here for observability; per-link candidate routing is
+				// deferred until peers negotiate ICE across multiple interfaces.
+				if linkID := msg.GetBody().GetLinkId(); linkID != "" {
+					log.Debugf("remote candidate from %s on link %q", msg.Key, linkID)
 				}
 
 				go conn.OnRemoteCandidate(candidate, e.routeManager.GetClientRoutes())
@@ -2418,6 +2429,7 @@ func convertToOfferAnswer(msg *sProto.Message) (*peer.OfferAnswer, error) {
 		RosenpassAddr:   rosenpassAddr,
 		RelaySrvAddress: msg.GetBody().GetRelayServerAddress(),
 		SessionID:       sessionID,
+		LinkID:          msg.GetBody().GetLinkId(),
 	}
 	return &offerAnswer, nil
 }
