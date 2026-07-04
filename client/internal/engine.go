@@ -213,6 +213,11 @@ type Engine struct {
 	// closing them; this map is for reference and health checks.
 	meshIfaces map[string]*iface.WGIface
 
+	// meshICEConfigs holds a per-mesh-link ICE configuration (keyed by link id)
+	// bound to that interface's own UDP mux, so ICE candidate gathering happens on
+	// the same interface a peer is programmed on. The primary link uses e.udpMux.
+	meshICEConfigs map[string]icemaker.Config
+
 	udpMux *udpmux.UniversalUDPMuxDefault
 
 	// networkSerial is the latest CurrentSerial (state ID) of the network sent by the Management service
@@ -1541,6 +1546,19 @@ func (e *Engine) addNewPeer(peerConfig *mgmProto.RemotePeerConfig) error {
 	return nil
 }
 
+// selectICEConfig returns the ICE configuration for the chosen link: a mesh
+// link's own interface-bound config when available, otherwise the primary
+// (default) config. This keeps ICE candidate gathering on the same interface
+// the peer is programmed on.
+func selectICEConfig(linkID string, defaultCfg icemaker.Config, perLink map[string]icemaker.Config) icemaker.Config {
+	if linkID != "" && linkID != link.PrimaryLinkID {
+		if c, ok := perLink[linkID]; ok {
+			return c
+		}
+	}
+	return defaultCfg
+}
+
 func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentVersion string) (*peer.Conn, error) {
 	log.Debugf("creating peer connection %s", pubKey)
 
@@ -1582,7 +1600,7 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 			Addr:           e.getRosenpassAddr(),
 			PermissiveMode: e.config.RosenpassPermissive,
 		},
-		ICEConfig: e.createICEConfig(),
+		ICEConfig: selectICEConfig(linkID, e.createICEConfig(), e.meshICEConfigs),
 		LinkID:    linkID,
 	}
 
@@ -2506,11 +2524,19 @@ func (e *Engine) startMeshLink(ml profilemanager.MeshLinkConfig) error {
 	if err := wg.Create(); err != nil {
 		return fmt.Errorf("create interface %s: %w", ml.InterfaceName, err)
 	}
-	// Bring the device up. Mesh links are static (no ICE), so the returned UDP
-	// mux is not needed.
-	if _, err := wg.Up(); err != nil {
+	// Bring the device up. The returned UDP mux is retained so that
+	// server-distributed (ICE) peers routed to this link gather candidates on
+	// this interface rather than the primary one.
+	mux, err := wg.Up()
+	if err != nil {
 		_ = wg.Close()
 		return fmt.Errorf("bring up interface %s: %w", ml.InterfaceName, err)
+	}
+	if mux != nil {
+		if e.meshICEConfigs == nil {
+			e.meshICEConfigs = make(map[string]icemaker.Config)
+		}
+		e.meshICEConfigs[ml.ID] = e.createICEConfigForMux(mux)
 	}
 
 	priority := ml.Priority

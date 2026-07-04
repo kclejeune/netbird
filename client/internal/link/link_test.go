@@ -50,7 +50,7 @@ func TestNewManager_SingleLink(t *testing.T) {
 		t.Fatal("single link should not report IsMultiLink")
 	}
 	// Default link must be engine-owned (not closed by Manager).
-	def, ok := mgr.GetLink(primaryLinkID)
+	def, ok := mgr.GetLink(PrimaryLinkID)
 	if !ok || def.ownsIface {
 		t.Fatal("default link should exist and be engine-owned (ownsIface=false)")
 	}
@@ -153,7 +153,7 @@ func TestSelectLink_NoReachability_FallsBackToPrimary(t *testing.T) {
 	// A peer with no reachability entries must select the primary, even though a
 	// higher-priority mesh link exists — mesh links only serve their own peers.
 	sel := mgr.SelectLink("ice-peer")
-	if sel == nil || sel.ID != primaryLinkID {
+	if sel == nil || sel.ID != PrimaryLinkID {
 		t.Fatalf("expected primary fallback, got %v", sel)
 	}
 }
@@ -209,7 +209,7 @@ func TestSelectLink_NoStickAfterRecovery(t *testing.T) {
 
 func TestSelectLink_AllDown(t *testing.T) {
 	mgr := NewManager(&mockIface{name: "wg0"})
-	def, _ := mgr.GetLink(primaryLinkID)
+	def, _ := mgr.GetLink(PrimaryLinkID)
 	def.UpdateState(LinkState{Up: false})
 	if sel := mgr.SelectLink("peerA"); sel != nil {
 		t.Fatalf("expected nil when all candidates down, got %s", sel.ID)
@@ -245,7 +245,7 @@ func TestSetPeerLinks_ClearFallsBackToPrimary(t *testing.T) {
 	}
 	// Clear reachability -> primary fallback.
 	mgr.SetPeerLinks("peerA", nil)
-	if sel := mgr.SelectLink("peerA"); sel.ID != primaryLinkID {
+	if sel := mgr.SelectLink("peerA"); sel.ID != PrimaryLinkID {
 		t.Fatalf("expected primary after clear, got %s", sel.ID)
 	}
 }

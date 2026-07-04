@@ -91,7 +91,7 @@ func (mo *Monitor) Tick() {
 		ifName := l.Iface.Name()
 
 		// Primary link: always up; annotate latency if a neighbour reports one.
-		if l.ID == primaryLinkID {
+		if l.ID == PrimaryLinkID {
 			st := l.State()
 			st.Up = true
 			st.LastProbe = now

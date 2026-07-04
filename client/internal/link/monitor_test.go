@@ -15,7 +15,7 @@ func newMonitorFor(mgr *Manager, neigh NeighbourFunc, live LivenessFunc) *Monito
 func TestMonitor_PrimaryAlwaysUp(t *testing.T) {
 	mgr := NewManager(&mockIface{name: "wg0"})
 	// Force default down first to prove the monitor forces it back up.
-	def, _ := mgr.GetLink(primaryLinkID)
+	def, _ := mgr.GetLink(PrimaryLinkID)
 	def.UpdateState(LinkState{Up: false})
 
 	mo := newMonitorFor(mgr, nil, func(string) (bool, uint32) { return false, 0 })
@@ -38,7 +38,7 @@ func TestMonitor_PrimaryLatencyFromNeighbour(t *testing.T) {
 	}, nil)
 	mo.Tick()
 
-	def, _ := mgr.GetLink(primaryLinkID)
+	def, _ := mgr.GetLink(PrimaryLinkID)
 	st := def.State()
 	if !st.Up || st.LatencyMs != 25 {
 		t.Fatalf("expected primary up with latency 25, got up=%v latency=%d", st.Up, st.LatencyMs)

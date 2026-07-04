@@ -23,12 +23,12 @@ func (f *fakeSignalClient) GetStatus() signal.Status { return signal.StreamConne
 func (f *fakeSignalClient) Receive(context.Context, func(*sProto.Message) error) error {
 	return nil
 }
-func (f *fakeSignalClient) Ready() bool                             { return true }
-func (f *fakeSignalClient) IsHealthy() bool                         { return true }
-func (f *fakeSignalClient) WaitStreamConnected()                    {}
+func (f *fakeSignalClient) Ready() bool                                 { return true }
+func (f *fakeSignalClient) IsHealthy() bool                             { return true }
+func (f *fakeSignalClient) WaitStreamConnected()                        {}
 func (f *fakeSignalClient) SendToStream(*sProto.EncryptedMessage) error { return nil }
-func (f *fakeSignalClient) Send(m *sProto.Message) error            { f.sent = append(f.sent, m); return nil }
-func (f *fakeSignalClient) SetOnReconnectedListener(func())         {}
+func (f *fakeSignalClient) Send(m *sProto.Message) error                { f.sent = append(f.sent, m); return nil }
+func (f *fakeSignalClient) SetOnReconnectedListener(func())             {}
 
 func newTestSignaler(t *testing.T) (*Signaler, *fakeSignalClient) {
 	t.Helper()

@@ -33,9 +33,9 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// primaryLinkID is the id of the default interface-link that wraps the engine's
+// PrimaryLinkID is the id of the default interface-link that wraps the engine's
 // primary WireGuard interface.
-const primaryLinkID = "default"
+const PrimaryLinkID = "default"
 
 // Iface is the minimal lifecycle contract the Manager needs from a link's
 // interface. The full WireGuard interface (iface.WGIface) satisfies it.
@@ -150,15 +150,15 @@ func NewManager(primaryIface Iface) *Manager {
 		byPeer:    make(map[string]string),
 	}
 	if primaryIface != nil {
-		m.links[primaryLinkID] = &Link{
-			ID:            primaryLinkID,
+		m.links[PrimaryLinkID] = &Link{
+			ID:            PrimaryLinkID,
 			TransportType: "wireguard",
 			Priority:      0,
 			Iface:         primaryIface,
 			ownsIface:     false,
 			state:         LinkState{Up: true},
 		}
-		m.primary = primaryLinkID
+		m.primary = PrimaryLinkID
 	}
 	return m
 }
