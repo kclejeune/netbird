@@ -4403,6 +4403,43 @@ components:
           type: string
           description: A human-readable error message.
           example: "couldn't parse JSON request"
+    MeshLink:
+      type: object
+      description: A transport link a peer is reachable over, for multi-link (MANET) routing.
+      properties:
+        linkId:
+          type: string
+          description: Unique identifier of the link (must match the client interface link id).
+          example: mesh0
+        transportType:
+          type: string
+          description: Transport type for the link.
+          example: wireguard
+        endpoint:
+          type: string
+          description: Optional static transport endpoint (host:port).
+          example: "10.0.0.2:51820"
+        mtu:
+          type: integer
+          description: Link MTU (0 = default).
+          example: 1280
+        priority:
+          type: integer
+          description: Path-selection priority (lower is preferred).
+          example: 10
+        cost:
+          type: integer
+          description: Routing cost metric (advisory).
+          example: 50
+        wgIfaceName:
+          type: string
+          description: WireGuard interface name for the link.
+          example: wt-mesh0
+        multicastEnabled:
+          type: boolean
+          description: Whether multicast beacon discovery is enabled for the link.
+      required:
+        - linkId
   responses:
     not_found:
       description: Resource not found
@@ -5455,6 +5492,77 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/AccessiblePeer'
+        '400':
+          "$ref": "#/components/responses/bad_request"
+        '401':
+          "$ref": "#/components/responses/requires_authentication"
+        '403':
+          "$ref": "#/components/responses/forbidden"
+        '500':
+          "$ref": "#/components/responses/internal_error"
+  /api/peers/{peerId}/mesh-links:
+    get:
+      summary: List a peer's mesh links
+      description: Returns the transport links a peer is reachable over for multi-link (MANET) routing.
+      tags: [ Peers ]
+      security:
+        - BearerAuth: [ ]
+        - TokenAuth: [ ]
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema:
+            type: string
+          description: The unique identifier of a peer
+      responses:
+        '200':
+          description: A JSON Array of the peer's mesh links
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MeshLink'
+        '400':
+          "$ref": "#/components/responses/bad_request"
+        '401':
+          "$ref": "#/components/responses/requires_authentication"
+        '403':
+          "$ref": "#/components/responses/forbidden"
+        '500':
+          "$ref": "#/components/responses/internal_error"
+    put:
+      summary: Replace a peer's mesh links
+      description: Replaces the full set of transport links a peer is reachable over. Distributed to other peers in the network map.
+      tags: [ Peers ]
+      security:
+        - BearerAuth: [ ]
+        - TokenAuth: [ ]
+      parameters:
+        - in: path
+          name: peerId
+          required: true
+          schema:
+            type: string
+          description: The unique identifier of a peer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/MeshLink'
+      responses:
+        '200':
+          description: The updated JSON Array of the peer's mesh links
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MeshLink'
         '400':
           "$ref": "#/components/responses/bad_request"
         '401':
